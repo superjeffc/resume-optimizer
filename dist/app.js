@@ -83,6 +83,46 @@ function initLoadingUI(hasJobDesc) {
   }
 }
 
+function setStageState(stageId, state) {
+  const stepEl = document.getElementById(`step-${stageId}`);
+  if (!stepEl) return;
+
+  const indicator = stepEl.querySelector('.step-indicator');
+  const statusText = stepEl.querySelector('.step-status');
+
+  if (state === 'done') {
+    stepEl.className = 'flex items-center justify-between py-1.5 px-2.5 rounded-lg text-emerald-400 bg-emerald-950/30 border border-emerald-900/50';
+    if (indicator) {
+      indicator.className = 'step-indicator w-4 h-4 rounded-full flex items-center justify-center text-[10px] bg-emerald-900 border border-emerald-500 text-emerald-300 font-bold';
+      indicator.textContent = '✓';
+    }
+    if (statusText) {
+      statusText.className = 'step-status text-[11px] text-emerald-400 font-mono font-semibold';
+      statusText.textContent = 'Done';
+    }
+  } else if (state === 'running') {
+    stepEl.className = 'flex items-center justify-between py-1.5 px-2.5 rounded-lg text-indigo-300 bg-indigo-950/40 border border-indigo-900/60 shadow-sm';
+    if (indicator) {
+      indicator.className = 'step-indicator w-4 h-4 rounded-full flex items-center justify-center text-[10px] bg-indigo-900 border border-indigo-500 text-cyan-300 animate-pulse font-bold';
+      indicator.textContent = '●';
+    }
+    if (statusText) {
+      statusText.className = 'step-status text-[11px] text-cyan-300 font-mono animate-pulse';
+      statusText.textContent = 'Running...';
+    }
+  } else {
+    stepEl.className = 'flex items-center justify-between py-1.5 px-2.5 rounded-lg text-gray-500 transition-all duration-200';
+    if (indicator) {
+      indicator.className = 'step-indicator w-4 h-4 rounded-full flex items-center justify-center text-[10px] bg-slate-800 border border-slate-700 text-gray-500 font-mono';
+      indicator.textContent = '○';
+    }
+    if (statusText) {
+      statusText.className = 'step-status text-[11px] text-gray-600 font-mono';
+      statusText.textContent = 'Waiting';
+    }
+  }
+}
+
 function updateProgressUI(event) {
   if (loadingStep && event.message) {
     loadingStep.textContent = event.message;
@@ -100,36 +140,37 @@ function updateProgressUI(event) {
     loadingProgressBar.style.width = `${Math.max(5, Math.min(100, event.percent))}%`;
   }
 
-  if (event.stage && loadingAgentList) {
+  if (!loadingAgentList) return;
+
+  if (event.status === 'complete' || event.percent === 100) {
+    PIPELINE_STAGES.forEach(s => setStageState(s.id, 'done'));
+    if (loadingSubagentsTotal && loadingSubagentsCount) {
+      loadingSubagentsCount.textContent = loadingSubagentsTotal.textContent;
+    }
+    return;
+  }
+
+  if (event.stage) {
     const isDone = event.stage.endsWith('_done');
     const stageKey = event.stage.replace('_done', '');
-    const currentStepEl = document.getElementById(`step-${stageKey}`);
 
-    if (currentStepEl) {
-      const indicator = currentStepEl.querySelector('.step-indicator');
-      const statusText = currentStepEl.querySelector('.step-status');
-      
-      if (isDone) {
-        currentStepEl.className = 'flex items-center justify-between py-1.5 px-2.5 rounded-lg text-emerald-400 bg-emerald-950/30 border border-emerald-900/50';
-        if (indicator) {
-          indicator.className = 'step-indicator w-4 h-4 rounded-full flex items-center justify-center text-[10px] bg-emerald-900 border border-emerald-500 text-emerald-300 font-bold';
-          indicator.textContent = '✓';
+    // Determine active stages currently in the DOM
+    const domStages = PIPELINE_STAGES.filter(s => document.getElementById(`step-${s.id}`));
+    const currentIndex = domStages.findIndex(s => s.id === stageKey);
+
+    if (currentIndex !== -1) {
+      domStages.forEach((stage, idx) => {
+        if (idx < currentIndex) {
+          // Preceding stages are completed
+          setStageState(stage.id, 'done');
+        } else if (idx === currentIndex) {
+          // Current stage is running or done
+          setStageState(stage.id, isDone ? 'done' : 'running');
+        } else {
+          // Following stages are still waiting
+          setStageState(stage.id, 'waiting');
         }
-        if (statusText) {
-          statusText.className = 'step-status text-[11px] text-emerald-400 font-mono font-semibold';
-          statusText.textContent = 'Done';
-        }
-      } else {
-        currentStepEl.className = 'flex items-center justify-between py-1.5 px-2.5 rounded-lg text-indigo-300 bg-indigo-950/40 border border-indigo-900/60 shadow-sm';
-        if (indicator) {
-          indicator.className = 'step-indicator w-4 h-4 rounded-full flex items-center justify-center text-[10px] bg-indigo-900 border border-indigo-500 text-cyan-300 animate-pulse font-bold';
-          indicator.textContent = '●';
-        }
-        if (statusText) {
-          statusText.className = 'step-status text-[11px] text-cyan-300 font-mono animate-pulse';
-          statusText.textContent = 'Running...';
-        }
-      }
+      });
     }
   }
 }
