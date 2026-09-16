@@ -555,7 +555,7 @@ const server = http.createServer((req, res) => {
   // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, CF-Access-Client-Id, CF-Access-Client-Secret');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -563,8 +563,27 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Parse URL to isolate pathname and query parameters
+  const parsedUrl = new URL(req.url, 'http://localhost');
+  let pathname = parsedUrl.pathname;
+
+  // Normalize path: strip trailing slash (except root)
+  if (pathname.length > 1 && pathname.endsWith('/')) {
+    pathname = pathname.replace(/\/+$/, '');
+  }
+
+  // Normalize optional /api prefix (e.g., /api/job/submit -> /job/submit)
+  let normalizedPath = pathname;
+  if (normalizedPath.startsWith('/api/')) {
+    normalizedPath = normalizedPath.slice(4);
+  } else if (normalizedPath === '/api') {
+    normalizedPath = '/';
+  }
+
+  console.log(`[HTTP ${req.method}] ${req.url} -> normalized path: "${normalizedPath}"`);
+
   // 1. Asynchronous Job Submission Endpoint
-  if (req.method === 'POST' && req.url === '/job/submit') {
+  if (req.method === 'POST' && (normalizedPath === '/job/submit' || normalizedPath === '/submit')) {
     if (!verifyAuth(req, res)) return;
 
     let body = '';
@@ -642,15 +661,39 @@ const server = http.createServer((req, res) => {
   }
 
   // 2. Asynchronous Job Status Endpoint
-  if (req.method === 'GET' && req.url.startsWith('/job/')) {
+  if (req.method === 'GET' && (normalizedPath.startsWith('/job/') || normalizedPath.startsWith('/status/'))) {
     if (!verifyAuth(req, res)) return;
 
-    const jobId = req.url.slice('/job/'.length);
+    let jobId = '';
+    if (normalizedPath.startsWith('/job/')) {
+      jobId = normalizedPath.slice('/job/'.length);
+    } else if (normalizedPath.startsWith('/status/')) {
+      jobId = normalizedPath.slice('/status/'.length);
+    }
+
+    // Support query parameter fallback if path was just /job or /status
+    if (!jobId) {
+      jobId = parsedUrl.searchParams.get('job_id') || parsedUrl.searchParams.get('jobId') || parsedUrl.searchParams.get('id') || '';
+    }
+
+    jobId = decodeURIComponent(jobId).trim().replace(/\/+$/, '');
+
+    if (!jobId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing jobId in URL path or query parameter' }));
+      return;
+    }
+
     const job = asyncJobs.get(jobId);
 
     if (!job) {
+      console.warn(`[Job Status 404] Job not found: "${jobId}". Known active jobs: ${Array.from(asyncJobs.keys()).join(', ') || 'none'}`);
       res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Job not found' }));
+      res.end(JSON.stringify({
+        error: 'Job not found',
+        jobId,
+        activeJobsCount: asyncJobs.size
+      }));
       return;
     }
 
@@ -671,7 +714,7 @@ const server = http.createServer((req, res) => {
   }
 
   // 3. Synchronous Execution Endpoint (Streaming)
-  if (req.method === 'POST' && req.url === '/execute') {
+  if (req.method === 'POST' && (normalizedPath === '/execute' || normalizedPath === '/run')) {
     if (!verifyAuth(req, res)) return;
 
     let body = '';
@@ -750,7 +793,7 @@ const server = http.createServer((req, res) => {
   }
 
   // 4. Health & Monitoring Endpoint
-  if (req.method === 'GET' && req.url === '/health') {
+  if (req.method === 'GET' && (normalizedPath === '/health' || normalizedPath === '/ping' || normalizedPath === '/')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
@@ -761,8 +804,21 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 5. Unmatched Route Fallback with Detailed Diagnostics
+  console.warn(`[HTTP 404] Unmatched route: ${req.method} "${req.url}" (normalized: "${normalizedPath}")`);
   res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'Not Found' }));
+  res.end(JSON.stringify({
+    error: 'Not Found',
+    method: req.method,
+    receivedUrl: req.url,
+    normalizedPath,
+    supportedRoutes: [
+      'POST /job/submit',
+      'GET /job/:jobId',
+      'POST /execute',
+      'GET /health'
+    ]
+  }));
 });
 
 const gracefulShutdown = () => {

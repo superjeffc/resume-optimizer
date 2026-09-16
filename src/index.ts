@@ -522,16 +522,26 @@ export default {
       });
     }
 
-    // 2. Handle GET status polling (e.g. /api/status/:jobId or /status/:jobId)
+    // 2. Handle GET endpoints (status polling and health checks)
     if (request.method === "GET") {
       let jobId = "";
       if (url.pathname.startsWith("/api/status/")) {
-        jobId = url.pathname.slice("/api/status/".length).trim();
+        jobId = url.pathname.slice("/api/status/".length);
       } else if (url.pathname.startsWith("/status/")) {
-        jobId = url.pathname.slice("/status/".length).trim();
+        jobId = url.pathname.slice("/status/".length);
+      } else if (url.pathname.startsWith("/api/job/")) {
+        jobId = url.pathname.slice("/api/job/".length);
+      } else if (url.pathname.startsWith("/job/")) {
+        jobId = url.pathname.slice("/job/".length);
       } else if (url.searchParams.has("job_id")) {
         jobId = url.searchParams.get("job_id") || "";
+      } else if (url.searchParams.has("jobId")) {
+        jobId = url.searchParams.get("jobId") || "";
+      } else if (url.searchParams.has("id")) {
+        jobId = url.searchParams.get("id") || "";
       }
+
+      jobId = decodeURIComponent(jobId).trim().replace(/\/+$/, "");
 
       if (jobId) {
         try {
@@ -563,13 +573,48 @@ export default {
           );
         }
       }
+
+      // Health check endpoint
+      const cleanGetPath = url.pathname.replace(/\/+$/, "") || "/";
+      if (cleanGetPath === "/health" || cleanGetPath === "/api/health") {
+        try {
+          const healthRes = await fetch("https://agy.superjeffc.com/health", {
+            method: "GET",
+            headers: {
+              "Authorization": `Bearer ${env.API_SECRET || ""}`,
+              "CF-Access-Client-Id": env.CF_CLIENT_ID || "",
+              "CF-Access-Client-Secret": env.CF_CLIENT_SECRET || ""
+            }
+          });
+          const healthData = await healthRes.text();
+          return new Response(healthData, {
+            status: healthRes.status,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        } catch (hErr: any) {
+          return new Response(
+            JSON.stringify({ status: "error", error: `Bridge unreachable: ${hErr.message || hErr}` }),
+            { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+      }
     }
 
-    // Support POST at "/", "/api", "/api/"
-    const validPaths = ["/", "/api", "/api/"];
-    if (!validPaths.includes(url.pathname)) {
+    // Support POST at "/", "/api", "/job/submit", "/api/job/submit"
+    const validPaths = ["/", "/api", "/job/submit", "/api/job/submit"];
+    const cleanPath = url.pathname.replace(/\/+$/, "") || "/";
+    if (!validPaths.includes(url.pathname) && !validPaths.includes(cleanPath)) {
       return new Response(
-        JSON.stringify({ error: "Not Found" }),
+        JSON.stringify({
+          error: "Not Found",
+          method: request.method,
+          path: url.pathname,
+          supportedRoutes: [
+            "POST / (or /api)",
+            "GET /api/status/:jobId (or /status/:jobId, /api/job/:jobId)",
+            "GET /health (or /api/health)"
+          ]
+        }),
         {
           status: 404,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
