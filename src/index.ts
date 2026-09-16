@@ -19,23 +19,40 @@ export interface Env {
 }
 
 async function callAgyBridge(env: Env, systemPrompt: string, userPrompt: string): Promise<string> {
-  const bridgeResponse = await fetch("https://agy.superjeffc.com/execute", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${env.API_SECRET || ""}`,
-      "CF-Access-Client-Id": env.CF_CLIENT_ID || "",
-      "CF-Access-Client-Secret": env.CF_CLIENT_SECRET || ""
-    },
-    body: JSON.stringify({ systemPrompt, userPrompt })
-  });
+  const maxRetries = 3;
+  let attempt = 0;
 
-  if (!bridgeResponse.ok) {
+  while (attempt < maxRetries) {
+    attempt++;
+    const bridgeResponse = await fetch("https://agy.superjeffc.com/execute", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${env.API_SECRET || ""}`,
+        "CF-Access-Client-Id": env.CF_CLIENT_ID || "",
+        "CF-Access-Client-Secret": env.CF_CLIENT_SECRET || ""
+      },
+      body: JSON.stringify({ systemPrompt, userPrompt })
+    });
+
+    if (bridgeResponse.ok) {
+      return await bridgeResponse.text();
+    }
+
+    const status = bridgeResponse.status;
     const errText = await bridgeResponse.text();
-    throw new Error(`Bridge returned status ${bridgeResponse.status}: ${errText}`);
+
+    if ((status === 503 || status === 429 || status === 502 || status === 504) && attempt < maxRetries) {
+      const delayMs = attempt * 2000;
+      console.warn(`Bridge returned status ${status}. Retrying attempt ${attempt}/${maxRetries} in ${delayMs}ms... Error: ${errText}`);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+      continue;
+    }
+
+    throw new Error(`Bridge returned status ${status}: ${errText}`);
   }
 
-  return await bridgeResponse.text();
+  throw new Error("Bridge request failed after maximum retries");
 }
 
 // Helper to find index of a byte array inside another byte array
@@ -369,26 +386,22 @@ export default {
       }
       const pageLabel = targetPageCount === 1 ? "SINGLE PAGE" : `${targetPageCount} PAGES`;
 
-      // 6. Request evaluation from parallel specialized agents
+      // 6. Request evaluation from specialized critic agents sequentially
       let critique = "";
       try {
-        console.log("Triggering parallel specialized critic agents...");
-        const criticPromises: Promise<string>[] = [
-          callAgyBridge(env, getGrammarSystemPrompt(), getGrammarUserPrompt(resumeMarkdown)),
-          callAgyBridge(env, getLayoutSystemPrompt(pageLabel), getLayoutUserPrompt(resumeMarkdown))
-        ];
+        console.log("Triggering specialized critic agents sequentially...");
 
-        let atsPromiseIndex = -1;
+        let atsFeedback = "";
         if (jobDescription) {
-          atsPromiseIndex = criticPromises.push(
-            callAgyBridge(env, getAtsSystemPrompt(), getAtsUserPrompt(resumeMarkdown, jobDescription))
-          ) - 1;
+          console.log("Running ATS critic agent...");
+          atsFeedback = await callAgyBridge(env, getAtsSystemPrompt(), getAtsUserPrompt(resumeMarkdown, jobDescription));
         }
 
-        const results = await Promise.all(criticPromises);
-        const grammarFeedback = results[0];
-        const layoutFeedback = results[1];
-        const atsFeedback = atsPromiseIndex !== -1 ? results[atsPromiseIndex] : "";
+        console.log("Running Grammar critic agent...");
+        const grammarFeedback = await callAgyBridge(env, getGrammarSystemPrompt(), getGrammarUserPrompt(resumeMarkdown));
+
+        console.log("Running Layout critic agent...");
+        const layoutFeedback = await callAgyBridge(env, getLayoutSystemPrompt(pageLabel), getLayoutUserPrompt(resumeMarkdown));
 
         // Combine critiques
         let compositeCritiques = `### Grammar, Tone, and Impact Feedback\n${grammarFeedback}\n\n### Formatting and Layout Feedback\n${layoutFeedback}`;
