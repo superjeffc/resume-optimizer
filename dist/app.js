@@ -340,15 +340,21 @@ analyzeBtn.addEventListener('click', async () => {
   }
 
   try {
-    const streamUrl = new URL(API_URL, window.location.origin);
-    streamUrl.searchParams.set('stream', 'true');
+    updateProgressUI({
+      stage: 'extraction',
+      completedAgents: 0,
+      totalAgents: jobDesc ? 5 : 4,
+      percent: 5,
+      message: 'Extracting text and analyzing document structure...'
+    });
 
-    const response = await fetch(streamUrl.toString(), {
+    const postUrl = new URL(API_URL, window.location.origin);
+    const response = await fetch(postUrl.toString(), {
       method: 'POST',
       body: formData
     });
 
-    if (!response.ok) {
+    if (!response.ok && response.status !== 202) {
       let errorMsg = `HTTP error! Status: ${response.status}`;
       try {
         const errText = await response.text();
@@ -404,10 +410,67 @@ analyzeBtn.addEventListener('click', async () => {
         throw new Error('Analysis stream closed before completion.');
       }
     } else {
+      let initialData;
       try {
-        data = await response.json();
+        initialData = await response.json();
       } catch (parseErr) {
         throw new Error(`Failed to parse API response as JSON: ${parseErr.message}`);
+      }
+
+      // Asynchronous background job (Default flow - eliminates Cloudflare 524 timeouts)
+      if (initialData.job_id || initialData.jobId) {
+        const jobId = initialData.job_id || initialData.jobId;
+        updateProgressUI({
+          stage: 'extraction_done',
+          completedAgents: 0,
+          totalAgents: initialData.totalAgents || (jobDesc ? 5 : 4),
+          percent: 15,
+          message: 'Document extracted. Enqueued for multi-agent evaluation...'
+        });
+
+        const statusPath = API_URL.endsWith('/') ? `${API_URL}status/` : `${API_URL}/status/`;
+        const statusUrl = new URL(`${statusPath}${encodeURIComponent(jobId)}`, window.location.origin).toString();
+
+        const pollIntervalMs = 2000;
+        const maxPollDurationMs = 15 * 60 * 1000; // 15-minute safety threshold
+        const startTime = Date.now();
+
+        while (true) {
+          if (Date.now() - startTime > maxPollDurationMs) {
+            throw new Error('Analysis timed out after 15 minutes. Please try again.');
+          }
+
+          await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+
+          let statusRes;
+          try {
+            statusRes = await fetch(statusUrl);
+          } catch (fetchErr) {
+            console.warn('Network error during status poll, will retry:', fetchErr);
+            continue;
+          }
+
+          if (!statusRes.ok) {
+            if (statusRes.status === 404) {
+              throw new Error('Job was not found on the server.');
+            }
+            console.warn(`Status polling received HTTP ${statusRes.status}, will retry...`);
+            continue;
+          }
+
+          const jobStatus = await statusRes.json();
+          updateProgressUI(jobStatus);
+
+          if (jobStatus.status === 'complete') {
+            data = jobStatus.result || jobStatus;
+            break;
+          } else if (jobStatus.status === 'error') {
+            throw new Error(jobStatus.error || 'Optimization pipeline encountered an error.');
+          }
+        }
+      } else {
+        // Direct synchronous response
+        data = initialData;
       }
     }
 

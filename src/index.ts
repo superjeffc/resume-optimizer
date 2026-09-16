@@ -512,6 +512,8 @@ export default {
       "Access-Control-Max-Age": "86400",
     };
 
+    const url = new URL(request.url);
+
     // 1. Handle CORS Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
@@ -520,8 +522,50 @@ export default {
       });
     }
 
+    // 2. Handle GET status polling (e.g. /api/status/:jobId or /status/:jobId)
+    if (request.method === "GET") {
+      let jobId = "";
+      if (url.pathname.startsWith("/api/status/")) {
+        jobId = url.pathname.slice("/api/status/".length).trim();
+      } else if (url.pathname.startsWith("/status/")) {
+        jobId = url.pathname.slice("/status/".length).trim();
+      } else if (url.searchParams.has("job_id")) {
+        jobId = url.searchParams.get("job_id") || "";
+      }
+
+      if (jobId) {
+        try {
+          const statusRes = await fetch(`https://agy.superjeffc.com/job/${encodeURIComponent(jobId)}`, {
+            method: "GET",
+            headers: {
+              "Authorization": `Bearer ${env.API_SECRET || ""}`,
+              "CF-Access-Client-Id": env.CF_CLIENT_ID || "",
+              "CF-Access-Client-Secret": env.CF_CLIENT_SECRET || ""
+            }
+          });
+
+          const statusData = await statusRes.text();
+          return new Response(statusData, {
+            status: statusRes.status,
+            headers: {
+              ...corsHeaders,
+              "Content-Type": "application/json"
+            }
+          });
+        } catch (statusErr: any) {
+          console.error("Failed to query bridge job status:", statusErr);
+          return new Response(
+            JSON.stringify({ error: `Failed to query job status: ${statusErr.message || statusErr}` }),
+            {
+              status: 502,
+              headers: { ...corsHeaders, "Content-Type": "application/json" }
+            }
+          );
+        }
+      }
+    }
+
     // Support POST at "/", "/api", "/api/"
-    const url = new URL(request.url);
     const validPaths = ["/", "/api", "/api/"];
     if (!validPaths.includes(url.pathname)) {
       return new Response(
@@ -591,70 +635,200 @@ export default {
         );
       }
 
-      const isStream = url.searchParams.get("stream") === "true" ||
-        formData.get("stream") === "true" ||
-        request.headers.get("Accept")?.includes("application/x-ndjson") ||
-        request.headers.get("Accept")?.includes("text/event-stream");
-
-      if (isStream) {
-        const { readable, writable } = new TransformStream();
-        const writer = writable.getWriter();
-        const encoder = new TextEncoder();
-
-        const sendEvent = async (data: any) => {
-          try {
-            await writer.write(encoder.encode(JSON.stringify(data) + "\n"));
-          } catch (e) {
-            console.warn("Stream write error:", e);
+      // If synchronous execution is explicitly requested (?sync=true)
+      if (url.searchParams.get("sync") === "true") {
+        const result = await executeOptimization(env, fileEntry, isPdf, jobDescription);
+        return new Response(
+          JSON.stringify(result),
+          {
+            status: 200,
+            headers: {
+              ...corsHeaders,
+              "Content-Type": "application/json"
+            }
           }
-        };
-
-        ctx.waitUntil((async () => {
-          try {
-            const result = await executeOptimization(
-              env,
-              fileEntry,
-              isPdf,
-              jobDescription,
-              async (update) => {
-                await sendEvent({ type: "progress", ...update });
-              }
-            );
-            await sendEvent({
-              type: "complete",
-              critique: result.critique,
-              extractedTextLength: result.extractedTextLength,
-              targetPageCount: result.targetPageCount
-            });
-          } catch (pipelineErr: any) {
-            console.error("Stream pipeline failed:", pipelineErr);
-            await sendEvent({
-              type: "error",
-              error: pipelineErr.message || String(pipelineErr)
-            });
-          } finally {
-            try {
-              await writer.close();
-            } catch {}
-          }
-        })());
-
-        return new Response(readable, {
-          status: 200,
-          headers: {
-            ...corsHeaders,
-            "Content-Type": "application/x-ndjson; charset=utf-8",
-            "Cache-Control": "no-cache, no-transform"
-          }
-        });
+        );
       }
 
-      // Non-streaming fallback
-      const result = await executeOptimization(env, fileEntry, isPdf, jobDescription);
+      // Default: Asynchronous background processing to prevent Cloudflare 524 timeouts
+      // 4. Perform in-memory text extraction natively in Worker isolate (fast, ~1-2s)
+      let fileBlob: Blob;
+      let targetPageCount = 1;
+      let pdfBuffer: ArrayBuffer | null = null;
+
+      if (isPdf) {
+        pdfBuffer = await fileEntry.arrayBuffer();
+        fileBlob = new Blob([pdfBuffer], { type: 'application/pdf' });
+
+        try {
+          const decoder = new TextDecoder('ascii');
+          const view = new Uint8Array(pdfBuffer);
+          const text = decoder.decode(view);
+          
+          const pagesMatches = [...text.matchAll(/\/Type\s*\/Pages[\s\S]*?\/Count\s+(\d+)/g)];
+          if (pagesMatches.length > 0) {
+            let pagesVal = 1;
+            for (const match of pagesMatches) {
+              const count = parseInt(match[1], 10);
+              if (count > 0 && count < 20) {
+                pagesVal = count;
+              }
+            }
+            targetPageCount = pagesVal;
+          } else {
+            const pageMatches = text.match(/\/Type\s*\/Page\b/g);
+            if (pageMatches && pageMatches.length > 0 && pageMatches.length < 20) {
+              targetPageCount = pageMatches.length;
+            }
+          }
+        } catch (pdfErr) {
+          console.warn("Failed to parse PDF binary page count:", pdfErr);
+        }
+      } else {
+        const imgBuffer = await fileEntry.arrayBuffer();
+        fileBlob = new Blob([imgBuffer], { type: fileType || 'image/jpeg' });
+        targetPageCount = 1;
+      }
+
+      let resumeMarkdown = "";
+      try {
+        const conversionResult = await env.AI.toMarkdown([
+          {
+            name: fileEntry.name || (isPdf ? 'resume.pdf' : 'resume.jpg'),
+            blob: fileBlob
+          }
+        ]);
+        resumeMarkdown = conversionResult?.[0]?.data || "";
+      } catch (convErr: any) {
+        console.error("Native document conversion error:", convErr);
+        return new Response(
+          JSON.stringify({ error: `Failed to extract text from file natively: ${convErr.message || convErr}` }),
+          {
+            status: 422,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      const isParserWarning = 
+        resumeMarkdown.toLowerCase().includes("empty of text content") || 
+        resumeMarkdown.toLowerCase().includes("no text found") ||
+        resumeMarkdown.toLowerCase().includes("keyword gap");
+
+      const resumeKeywords = [
+        "experience", "work", "employment", "history", "professional", 
+        "education", "university", "college", "school", "academic",
+        "skills", "technologies", "tools", "languages", 
+        "contact", "email", "phone", "address", "linkedin", "github"
+      ];
+      let hasResumeKeywords = resumeKeywords.some(keyword => 
+        resumeMarkdown.toLowerCase().includes(keyword)
+      );
+
+      if (!resumeMarkdown || resumeMarkdown.trim().length < 150 || isParserWarning || !hasResumeKeywords) {
+        let ocrSuccess = false;
+        if (isPdf && pdfBuffer) {
+          try {
+            const jpegs = extractJpegsFromPdf(pdfBuffer);
+            if (jpegs.length > 0) {
+              let concatenatedOcr = "";
+              const pagesToOcr = Math.min(jpegs.length, 3);
+              
+              for (let p = 0; p < pagesToOcr; p++) {
+                const imgBlob = new Blob([jpegs[p]], { type: 'image/jpeg' });
+                const ocrResult = await env.AI.toMarkdown([
+                  {
+                    name: `scanned_page_${p + 1}.jpg`,
+                    blob: imgBlob
+                  }
+                ]);
+                const pageText = ocrResult?.[0]?.data || "";
+                if (pageText && pageText.trim().length > 50) {
+                  concatenatedOcr += `\n\n--- PAGE ${p + 1} ---\n\n` + pageText;
+                }
+              }
+              
+              const hasOcrKeywords = resumeKeywords.some(keyword => 
+                concatenatedOcr.toLowerCase().includes(keyword)
+              );
+              
+              if (concatenatedOcr && concatenatedOcr.trim().length >= 150 && hasOcrKeywords) {
+                resumeMarkdown = concatenatedOcr;
+                hasResumeKeywords = true;
+                ocrSuccess = true;
+              }
+            }
+          } catch (ocrErr) {
+            console.warn("Scanned PDF OCR fallback failed with error:", ocrErr);
+          }
+        }
+
+        if (!ocrSuccess) {
+          let errorMsg = "Failed to extract legible text from the uploaded file.";
+          if (isPdf || isParserWarning || !hasResumeKeywords) {
+            errorMsg = "The uploaded PDF appears to be a scanned image with no readable text layer. Please upload a standard PDF with selectable text, or upload a PNG/JPEG image of your résumé directly.";
+          }
+          return new Response(
+            JSON.stringify({ error: errorMsg }),
+            {
+              status: 422,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            }
+          );
+        }
+      }
+
+      // Page calibration
+      const activePages = getNonEmptyPageCount(resumeMarkdown);
+      targetPageCount = activePages;
+      const charCount = resumeMarkdown.length;
+      if (targetPageCount === 1) {
+        if (charCount > 5800) targetPageCount = 2;
+        if (charCount > 11000) targetPageCount = 3;
+      }
+
+      // 5. Submit job to persistent bridge service asynchronously
+      const jobId = crypto.randomUUID();
+      const submitRes = await fetch("https://agy.superjeffc.com/job/submit", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${env.API_SECRET || ""}`,
+          "CF-Access-Client-Id": env.CF_CLIENT_ID || "",
+          "CF-Access-Client-Secret": env.CF_CLIENT_SECRET || ""
+        },
+        body: JSON.stringify({
+          jobId,
+          resumeMarkdown,
+          jobDescription,
+          targetPageCount
+        })
+      });
+
+      if (!submitRes.ok) {
+        const errText = await submitRes.text();
+        console.error("Bridge rejected async job:", submitRes.status, errText);
+        return new Response(
+          JSON.stringify({ error: `Bridge service error: ${errText}` }),
+          {
+            status: submitRes.status,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          }
+        );
+      }
+
+      // 6. Return HTTP 202 Accepted immediately to client with job_id
       return new Response(
-        JSON.stringify(result),
+        JSON.stringify({
+          status: "processing",
+          job_id: jobId,
+          targetPageCount,
+          extractedTextLength: resumeMarkdown.length,
+          totalAgents: jobDescription ? 5 : 4,
+          message: "Optimization job queued successfully"
+        }),
         {
-          status: 200,
+          status: 202,
           headers: {
             ...corsHeaders,
             "Content-Type": "application/json"
