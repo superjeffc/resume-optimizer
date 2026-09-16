@@ -134,13 +134,381 @@ function getNonEmptyPageCount(resumeMarkdown: string): number {
   return nonEmptyCount > 0 ? nonEmptyCount : 1;
 }
 
+export interface ProgressUpdate {
+  stage: string;
+  completedAgents: number;
+  totalAgents: number;
+  agentName?: string;
+  message: string;
+  percent: number;
+}
+
+async function executeOptimization(
+  env: Env,
+  fileEntry: File,
+  isPdf: boolean,
+  jobDescription: string,
+  onProgress?: (update: ProgressUpdate) => Promise<void>
+): Promise<{ critique: string; extractedTextLength: number; targetPageCount: number }> {
+  const totalAgents = jobDescription ? 5 : 4;
+  let completedAgents = 0;
+
+  if (onProgress) {
+    await onProgress({
+      stage: 'extraction',
+      completedAgents: 0,
+      totalAgents,
+      message: 'Extracting text and document structure...',
+      percent: 10
+    });
+  }
+
+  // Convert to an ArrayBuffer and create a clean Blob
+  let fileBlob: Blob;
+  let targetPageCount = 1;
+  let pdfBuffer: ArrayBuffer | null = null;
+
+  if (isPdf) {
+    pdfBuffer = await fileEntry.arrayBuffer();
+    fileBlob = new Blob([pdfBuffer], { type: 'application/pdf' });
+
+    // Extract page count directly from PDF binary metadata structure
+    try {
+      const decoder = new TextDecoder('ascii');
+      const view = new Uint8Array(pdfBuffer);
+      const text = decoder.decode(view);
+      
+      const pagesMatches = [...text.matchAll(/\/Type\s*\/Pages[\s\S]*?\/Count\s+(\d+)/g)];
+      if (pagesMatches.length > 0) {
+        let pagesVal = 1;
+        for (const match of pagesMatches) {
+          const count = parseInt(match[1], 10);
+          if (count > 0 && count < 20) {
+            pagesVal = count;
+          }
+        }
+        targetPageCount = pagesVal;
+      } else {
+        const pageMatches = text.match(/\/Type\s*\/Page\b/g);
+        if (pageMatches && pageMatches.length > 0 && pageMatches.length < 20) {
+          targetPageCount = pageMatches.length;
+        }
+      }
+      console.log(`Parsed actual PDF page count from binary metadata: ${targetPageCount}`);
+    } catch (pdfErr) {
+      console.warn("Failed to parse PDF binary page count:", pdfErr);
+    }
+  } else {
+    const imgBuffer = await fileEntry.arrayBuffer();
+    const fileType = fileEntry.type || 'image/jpeg';
+    fileBlob = new Blob([imgBuffer], { type: fileType });
+    targetPageCount = 1;
+  }
+
+  // Call env.AI.toMarkdown
+  let resumeMarkdown = "";
+  try {
+    const conversionResult = await env.AI.toMarkdown([
+      {
+        name: fileEntry.name || (isPdf ? 'resume.pdf' : 'resume.jpg'),
+        blob: fileBlob
+      }
+    ]);
+    resumeMarkdown = conversionResult?.[0]?.data || "";
+  } catch (convErr: any) {
+    console.error("Native document conversion error:", convErr);
+    throw new Error(`Failed to extract text from file natively: ${convErr.message || convErr}`);
+  }
+
+  const isParserWarning = 
+    resumeMarkdown.toLowerCase().includes("empty of text content") || 
+    resumeMarkdown.toLowerCase().includes("no text found") ||
+    resumeMarkdown.toLowerCase().includes("keyword gap");
+
+  const resumeKeywords = [
+    "experience", "work", "employment", "history", "professional", 
+    "education", "university", "college", "school", "academic",
+    "skills", "technologies", "tools", "languages", 
+    "contact", "email", "phone", "address", "linkedin", "github"
+  ];
+  let hasResumeKeywords = resumeKeywords.some(keyword => 
+    resumeMarkdown.toLowerCase().includes(keyword)
+  );
+
+  if (!resumeMarkdown || resumeMarkdown.trim().length < 150 || isParserWarning || !hasResumeKeywords) {
+    let ocrSuccess = false;
+    if (isPdf && pdfBuffer) {
+      console.log("PDF text extraction failed or returned blank. Attempting scanned PDF JPEG extraction fallback...");
+      if (onProgress) {
+        await onProgress({
+          stage: 'ocr',
+          completedAgents: 0,
+          totalAgents,
+          message: 'Scanned document detected. Running Workers AI OCR fallback...',
+          percent: 15
+        });
+      }
+      try {
+        const jpegs = extractJpegsFromPdf(pdfBuffer);
+        if (jpegs.length > 0) {
+          console.log(`Found ${jpegs.length} scanned JPEG(s) inside PDF. Running multi-page Workers AI OCR fallback...`);
+          let concatenatedOcr = "";
+          const pagesToOcr = Math.min(jpegs.length, 3);
+          
+          for (let p = 0; p < pagesToOcr; p++) {
+            console.log(`Running Workers AI OCR on page ${p + 1}/${pagesToOcr}...`);
+            const imgBlob = new Blob([jpegs[p]], { type: 'image/jpeg' });
+            const ocrResult = await env.AI.toMarkdown([
+              {
+                name: `scanned_page_${p + 1}.jpg`,
+                blob: imgBlob
+              }
+            ]);
+            const pageText = ocrResult?.[0]?.data || "";
+            if (pageText && pageText.trim().length > 50) {
+              concatenatedOcr += `\n\n--- PAGE ${p + 1} ---\n\n` + pageText;
+            }
+          }
+          
+          const hasOcrKeywords = resumeKeywords.some(keyword => 
+            concatenatedOcr.toLowerCase().includes(keyword)
+          );
+          
+          if (concatenatedOcr && concatenatedOcr.trim().length >= 150 && hasOcrKeywords) {
+            resumeMarkdown = concatenatedOcr;
+            hasResumeKeywords = true;
+            ocrSuccess = true;
+            console.log("Scanned PDF OCR fallback succeeded!");
+          }
+        }
+      } catch (ocrErr) {
+        console.warn("Scanned PDF OCR fallback failed with error:", ocrErr);
+      }
+    }
+
+    if (!ocrSuccess) {
+      console.warn(`Validation failed. Legible text length: ${resumeMarkdown ? resumeMarkdown.trim().length : 0} chars.`);
+      let errorMsg = "Failed to extract legible text from the uploaded file.";
+      if (isPdf || isParserWarning || !hasResumeKeywords) {
+        errorMsg = "The uploaded PDF appears to be a scanned image with no readable text layer. Please upload a standard PDF with selectable text, or upload a PNG/JPEG image of your résumé directly.";
+      }
+      throw new Error(errorMsg);
+    }
+  }
+
+  // Page calibration
+  const activePages = getNonEmptyPageCount(resumeMarkdown);
+  targetPageCount = activePages;
+  const charCount = resumeMarkdown.length;
+  if (targetPageCount === 1) {
+    if (charCount > 5800) targetPageCount = 2;
+    if (charCount > 11000) targetPageCount = 3;
+  }
+  const pageLabel = targetPageCount === 1 ? "SINGLE PAGE" : `${targetPageCount} PAGES`;
+
+  if (onProgress) {
+    await onProgress({
+      stage: 'calibration',
+      completedAgents: 0,
+      totalAgents,
+      message: `Calibrating document structure (${pageLabel} target)...`,
+      percent: 20
+    });
+  }
+
+  // 6. Request evaluation from specialized critic agents sequentially
+  let atsFeedback = "";
+  if (jobDescription) {
+    if (onProgress) {
+      await onProgress({
+        stage: 'ats',
+        completedAgents,
+        totalAgents,
+        agentName: 'ATS & Keyword Matcher',
+        message: 'Running ATS & Keyword Matcher agent...',
+        percent: 25
+      });
+    }
+    atsFeedback = await callAgyBridge(env, getAtsSystemPrompt(), getAtsUserPrompt(resumeMarkdown, jobDescription));
+    completedAgents++;
+    if (onProgress) {
+      await onProgress({
+        stage: 'ats_done',
+        completedAgents,
+        totalAgents,
+        agentName: 'ATS & Keyword Matcher',
+        message: `ATS & Keyword Matcher finished (${completedAgents}/${totalAgents} subagents complete).`,
+        percent: 35
+      });
+    }
+  }
+
+  if (onProgress) {
+    await onProgress({
+      stage: 'grammar',
+      completedAgents,
+      totalAgents,
+      agentName: 'Grammar, Tone & Impact Coach',
+      message: 'Running Grammar, Tone & Impact Coach agent...',
+      percent: 40
+    });
+  }
+  const grammarFeedback = await callAgyBridge(env, getGrammarSystemPrompt(), getGrammarUserPrompt(resumeMarkdown));
+  completedAgents++;
+  if (onProgress) {
+    await onProgress({
+      stage: 'grammar_done',
+      completedAgents,
+      totalAgents,
+      agentName: 'Grammar, Tone & Impact Coach',
+      message: `Grammar, Tone & Impact Coach finished (${completedAgents}/${totalAgents} subagents complete).`,
+      percent: 55
+    });
+  }
+
+  if (onProgress) {
+    await onProgress({
+      stage: 'layout',
+      completedAgents,
+      totalAgents,
+      agentName: 'Layout & Spacing Auditor',
+      message: 'Running Layout & Spacing Auditor agent...',
+      percent: 60
+    });
+  }
+  const layoutFeedback = await callAgyBridge(env, getLayoutSystemPrompt(pageLabel), getLayoutUserPrompt(resumeMarkdown));
+  completedAgents++;
+  if (onProgress) {
+    await onProgress({
+      stage: 'layout_done',
+      completedAgents,
+      totalAgents,
+      agentName: 'Layout & Spacing Auditor',
+      message: `Layout & Spacing Auditor finished (${completedAgents}/${totalAgents} subagents complete).`,
+      percent: 70
+    });
+  }
+
+  // Combine critiques
+  let compositeCritiques = `### Grammar, Tone, and Impact Feedback\n${grammarFeedback}\n\n### Formatting and Layout Feedback\n${layoutFeedback}`;
+  if (atsFeedback) {
+    compositeCritiques = `### ATS Alignment and Keyword Feedback\n${atsFeedback}\n\n` + compositeCritiques;
+  }
+
+  // 7. Self-Correction Loop (Editor-in-Chief & Validator Agents)
+  let validationFeedback = "";
+  let attempts = 0;
+  const maxAttempts = 3;
+  let finalHtml = "";
+  let finalCritique = "";
+
+  while (attempts < maxAttempts) {
+    attempts++;
+    console.log(`Self-correction loop: Attempt ${attempts}/${maxAttempts}`);
+
+    if (onProgress) {
+      await onProgress({
+        stage: 'editor',
+        completedAgents,
+        totalAgents,
+        agentName: 'Editor-in-Chief & Synthesis Agent',
+        message: attempts === 1
+          ? 'Editor-in-Chief: Synthesizing critiques and drafting rewritten résumé...'
+          : `Editor-in-Chief: Refining draft based on validation audit (Pass ${attempts})...`,
+        percent: Math.min(85, 75 + (attempts - 1) * 5)
+      });
+    }
+
+    const editorOutput = await callAgyBridge(
+      env,
+      getEditorSystemPrompt(pageLabel),
+      getEditorUserPrompt(resumeMarkdown, jobDescription, compositeCritiques, validationFeedback)
+    );
+
+    const parts = editorOutput.split("=== REWRITTEN RESUME ===");
+    const critiquePart = parts[0]?.trim() || "";
+    const htmlPart = parts[1]?.trim() || "";
+
+    finalCritique = critiquePart;
+    finalHtml = htmlPart;
+
+    if (attempts === 1) {
+      completedAgents++;
+      if (onProgress) {
+        await onProgress({
+          stage: 'editor_done',
+          completedAgents,
+          totalAgents,
+          agentName: 'Editor-in-Chief & Synthesis Agent',
+          message: `Editor-in-Chief finished initial draft (${completedAgents}/${totalAgents} subagents complete).`,
+          percent: 85
+        });
+      }
+    }
+
+    if (!finalHtml) {
+      validationFeedback = "Validation Error: Could not find '=== REWRITTEN RESUME ===' delimiter or the HTML block is empty.";
+      continue;
+    }
+
+    // Run compliance validation
+    console.log(`Auditing HTML draft (Attempt ${attempts})...`);
+    if (onProgress) {
+      await onProgress({
+        stage: 'validator',
+        completedAgents,
+        totalAgents,
+        agentName: 'Compliance Auditor & Validator',
+        message: `Compliance Auditor: Auditing HTML draft against ATS & layout rules (Pass ${attempts})...`,
+        percent: 90
+      });
+    }
+
+    const auditResult = (await callAgyBridge(
+      env,
+      getValidatorSystemPrompt(pageLabel),
+      getValidatorUserPrompt(finalHtml)
+    )).trim();
+
+    if (auditResult.toUpperCase() === "PASS") {
+      console.log("HTML validation passed compliance audit.");
+      completedAgents++;
+      if (onProgress) {
+        await onProgress({
+          stage: 'validator_done',
+          completedAgents,
+          totalAgents,
+          agentName: 'Compliance Auditor & Validator',
+          message: `Compliance audit passed! (${completedAgents}/${totalAgents} subagents complete). Finalizing...`,
+          percent: 100
+        });
+      }
+      break;
+    } else {
+      console.warn(`Validation failed on attempt ${attempts}. Issues:\n${auditResult}`);
+      validationFeedback = auditResult;
+    }
+  }
+
+  const critique = finalCritique + "\n\n=== REWRITTEN RESUME ===\n" + finalHtml;
+  if (!critique.trim()) {
+    throw new Error("Empty critique returned from evaluation loop.");
+  }
+
+  return {
+    critique,
+    extractedTextLength: resumeMarkdown.length,
+    targetPageCount
+  };
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // Define CORS headers
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Headers": "Content-Type, Accept",
       "Access-Control-Max-Age": "86400",
     };
 
@@ -191,8 +559,6 @@ export default {
       }
       
       let fileEntry: File | null = null;
-
-      // Find the first File object in the form data
       for (const [key, value] of formData.entries()) {
         if (value instanceof File) {
           fileEntry = value;
@@ -210,7 +576,6 @@ export default {
         );
       }
 
-      // Check if file is PDF or image (by mime type or extension)
       const fileType = fileEntry.type || "";
       const fileName = (fileEntry.name || "").toLowerCase();
       const isPdf = fileType === "application/pdf" || fileName.endsWith(".pdf");
@@ -226,266 +591,68 @@ export default {
         );
       }
 
-      // 4. Convert to an ArrayBuffer and then create a clean Blob with explicit type
-      let fileBlob: Blob;
-      let targetPageCount = 1;
-      let pdfBuffer: ArrayBuffer | null = null;
+      const isStream = url.searchParams.get("stream") === "true" ||
+        formData.get("stream") === "true" ||
+        request.headers.get("Accept")?.includes("application/x-ndjson") ||
+        request.headers.get("Accept")?.includes("text/event-stream");
 
-      if (isPdf) {
-        pdfBuffer = await fileEntry.arrayBuffer();
-        fileBlob = new Blob([pdfBuffer], { type: 'application/pdf' });
+      if (isStream) {
+        const { readable, writable } = new TransformStream();
+        const writer = writable.getWriter();
+        const encoder = new TextEncoder();
 
-        // Extract page count directly from PDF binary metadata structure
-        try {
-          const decoder = new TextDecoder('ascii');
-          const view = new Uint8Array(pdfBuffer);
-          const text = decoder.decode(view);
-          
-          // Look for the root /Pages object which contains the true page count (scoped by Type /Pages)
-          const pagesMatches = [...text.matchAll(/\/Type\s*\/Pages[\s\S]*?\/Count\s+(\d+)/g)];
-          if (pagesMatches.length > 0) {
-            let pagesVal = 1;
-            for (const match of pagesMatches) {
-              const count = parseInt(match[1], 10);
-              if (count > 0 && count < 20) {
-                pagesVal = count; // Root /Pages count
-              }
-            }
-            targetPageCount = pagesVal;
-          } else {
-            // Fallback to counting occurrences of individual /Type /Page objects
-            const pageMatches = text.match(/\/Type\s*\/Page\b/g);
-            if (pageMatches && pageMatches.length > 0 && pageMatches.length < 20) {
-              targetPageCount = pageMatches.length;
-            }
-          }
-          console.log(`Parsed actual PDF page count from binary metadata: ${targetPageCount}`);
-        } catch (pdfErr) {
-          console.warn("Failed to parse PDF binary page count:", pdfErr);
-        }
-      } else {
-        // It's an image
-        const imgBuffer = await fileEntry.arrayBuffer();
-        fileBlob = new Blob([imgBuffer], { type: fileType || 'image/jpeg' });
-        targetPageCount = 1; // Default to 1 page target for image uploads
-      }
-
-      // 5. Call env.AI.toMarkdown with the exact array-of-objects signature
-      let resumeMarkdown = "";
-      try {
-        const conversionResult = await env.AI.toMarkdown([
-          {
-            name: fileEntry.name || (isPdf ? 'resume.pdf' : 'resume.jpg'),
-            blob: fileBlob
-          }
-        ]);
-        resumeMarkdown = conversionResult?.[0]?.data || "";
-      } catch (convErr: any) {
-        console.error("Native document conversion error:", convErr);
-        return new Response(
-          JSON.stringify({ error: `Failed to extract text from file natively: ${convErr.message || convErr}` }),
-          {
-            status: 422,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      // Detect if the extracted text is empty, too short, or contains native parser indicators of a scanned/empty document
-      const isParserWarning = 
-        resumeMarkdown.toLowerCase().includes("empty of text content") || 
-        resumeMarkdown.toLowerCase().includes("no text found") ||
-        resumeMarkdown.toLowerCase().includes("keyword gap");
-
-      // Verify if the extracted text contains common resume sections or keywords to filter out binary noise or scanned documents
-      const resumeKeywords = [
-        "experience", "work", "employment", "history", "professional", 
-        "education", "university", "college", "school", "academic",
-        "skills", "technologies", "tools", "languages", 
-        "contact", "email", "phone", "address", "linkedin", "github"
-      ];
-      let hasResumeKeywords = resumeKeywords.some(keyword => 
-        resumeMarkdown.toLowerCase().includes(keyword)
-      );
-
-      if (!resumeMarkdown || resumeMarkdown.trim().length < 150 || isParserWarning || !hasResumeKeywords) {
-        let ocrSuccess = false;
-        if (isPdf && pdfBuffer) {
-          console.log("PDF text extraction failed or returned blank. Attempting scanned PDF JPEG extraction fallback...");
+        const sendEvent = async (data: any) => {
           try {
-            const jpegs = extractJpegsFromPdf(pdfBuffer);
-            if (jpegs.length > 0) {
-              console.log(`Found ${jpegs.length} scanned JPEG(s) inside PDF. Running multi-page Workers AI OCR fallback...`);
-              let concatenatedOcr = "";
-              const pagesToOcr = Math.min(jpegs.length, 3);
-              
-              for (let p = 0; p < pagesToOcr; p++) {
-                console.log(`Running Workers AI OCR on page ${p + 1}/${pagesToOcr}...`);
-                const imgBlob = new Blob([jpegs[p]], { type: 'image/jpeg' });
-                const ocrResult = await env.AI.toMarkdown([
-                  {
-                    name: `scanned_page_${p + 1}.jpg`,
-                    blob: imgBlob
-                  }
-                ]);
-                const pageText = ocrResult?.[0]?.data || "";
-                if (pageText && pageText.trim().length > 50) {
-                  concatenatedOcr += `\n\n--- PAGE ${p + 1} ---\n\n` + pageText;
-                }
+            await writer.write(encoder.encode(JSON.stringify(data) + "\n"));
+          } catch (e) {
+            console.warn("Stream write error:", e);
+          }
+        };
+
+        ctx.waitUntil((async () => {
+          try {
+            const result = await executeOptimization(
+              env,
+              fileEntry,
+              isPdf,
+              jobDescription,
+              async (update) => {
+                await sendEvent({ type: "progress", ...update });
               }
-              
-              const hasOcrKeywords = resumeKeywords.some(keyword => 
-                concatenatedOcr.toLowerCase().includes(keyword)
-              );
-              
-              if (concatenatedOcr && concatenatedOcr.trim().length >= 150 && hasOcrKeywords) {
-                resumeMarkdown = concatenatedOcr;
-                hasResumeKeywords = true;
-                ocrSuccess = true;
-                console.log("Scanned PDF OCR fallback succeeded!");
-              }
-            }
-          } catch (ocrErr) {
-            console.warn("Scanned PDF OCR fallback failed with error:", ocrErr);
+            );
+            await sendEvent({
+              type: "complete",
+              critique: result.critique,
+              extractedTextLength: result.extractedTextLength,
+              targetPageCount: result.targetPageCount
+            });
+          } catch (pipelineErr: any) {
+            console.error("Stream pipeline failed:", pipelineErr);
+            await sendEvent({
+              type: "error",
+              error: pipelineErr.message || String(pipelineErr)
+            });
+          } finally {
+            try {
+              await writer.close();
+            } catch {}
           }
-        }
+        })());
 
-        if (!ocrSuccess) {
-          console.warn(`Validation failed. Legible text length: ${resumeMarkdown ? resumeMarkdown.trim().length : 0} chars. Keywords match: ${hasResumeKeywords}. Warning: ${isParserWarning}.`);
-          console.warn(`Extracted preview: "${resumeMarkdown ? resumeMarkdown.substring(0, 150) : ""}"`);
-          
-          let errorMsg = "Failed to extract legible text from the uploaded file.";
-          if (isPdf || isParserWarning || !hasResumeKeywords) {
-            errorMsg = "The uploaded PDF appears to be a scanned image with no readable text layer. Please upload a standard PDF with selectable text, or upload a PNG/JPEG image of your résumé directly.";
+        return new Response(readable, {
+          status: 200,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/x-ndjson; charset=utf-8",
+            "Cache-Control": "no-cache, no-transform"
           }
-          
-          return new Response(
-            JSON.stringify({ error: errorMsg }),
-            {
-              status: 422,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            }
-          );
-        }
+        });
       }
 
-      // Calibration: Detect empty pages structurally and set target page count based on active content pages
-      const activePages = getNonEmptyPageCount(resumeMarkdown);
-      console.log(`PDF structural page analysis: parsed total pages = ${targetPageCount}, active content pages = ${activePages}`);
-      targetPageCount = activePages;
-
-      // Fallback: If page count was 1 but text volume is extremely large, adjust target up
-      const charCount = resumeMarkdown.length;
-      if (targetPageCount === 1) {
-        if (charCount > 5800) {
-          targetPageCount = 2;
-        }
-        if (charCount > 11000) {
-          targetPageCount = 3;
-        }
-      }
-      const pageLabel = targetPageCount === 1 ? "SINGLE PAGE" : `${targetPageCount} PAGES`;
-
-      // 6. Request evaluation from specialized critic agents sequentially
-      let critique = "";
-      try {
-        console.log("Triggering specialized critic agents sequentially...");
-
-        let atsFeedback = "";
-        if (jobDescription) {
-          console.log("Running ATS critic agent...");
-          atsFeedback = await callAgyBridge(env, getAtsSystemPrompt(), getAtsUserPrompt(resumeMarkdown, jobDescription));
-        }
-
-        console.log("Running Grammar critic agent...");
-        const grammarFeedback = await callAgyBridge(env, getGrammarSystemPrompt(), getGrammarUserPrompt(resumeMarkdown));
-
-        console.log("Running Layout critic agent...");
-        const layoutFeedback = await callAgyBridge(env, getLayoutSystemPrompt(pageLabel), getLayoutUserPrompt(resumeMarkdown));
-
-        // Combine critiques
-        let compositeCritiques = `### Grammar, Tone, and Impact Feedback\n${grammarFeedback}\n\n### Formatting and Layout Feedback\n${layoutFeedback}`;
-        if (atsFeedback) {
-          compositeCritiques = `### ATS Alignment and Keyword Feedback\n${atsFeedback}\n\n` + compositeCritiques;
-        }
-
-        // 7. Self-Correction Loop (Editor-in-Chief & Validator Agents)
-        let validationFeedback = "";
-        let attempts = 0;
-        const maxAttempts = 3;
-        let finalHtml = "";
-        let finalCritique = "";
-
-        while (attempts < maxAttempts) {
-          attempts++;
-          console.log(`Self-correction loop: Attempt ${attempts}/${maxAttempts}`);
-
-          const editorOutput = await callAgyBridge(
-            env,
-            getEditorSystemPrompt(pageLabel),
-            getEditorUserPrompt(resumeMarkdown, jobDescription, compositeCritiques, validationFeedback)
-          );
-
-          const parts = editorOutput.split("=== REWRITTEN RESUME ===");
-          const critiquePart = parts[0]?.trim() || "";
-          const htmlPart = parts[1]?.trim() || "";
-
-          finalCritique = critiquePart;
-          finalHtml = htmlPart;
-
-          if (!finalHtml) {
-            validationFeedback = "Validation Error: Could not find '=== REWRITTEN RESUME ===' delimiter or the HTML block is empty.";
-            continue;
-          }
-
-          // Run compliance validation
-          console.log(`Auditing HTML draft (Attempt ${attempts})...`);
-          const auditResult = (await callAgyBridge(
-            env,
-            getValidatorSystemPrompt(pageLabel),
-            getValidatorUserPrompt(finalHtml)
-          )).trim();
-
-          if (auditResult.toUpperCase() === "PASS") {
-            console.log("HTML validation passed compliance audit.");
-            break;
-          } else {
-            console.warn(`Validation failed on attempt ${attempts}. Issues:\n${auditResult}`);
-            validationFeedback = auditResult;
-          }
-        }
-
-        // If after loops we don't have the final HTML, construct a fallback
-        critique = finalCritique + "\n\n=== REWRITTEN RESUME ===\n" + finalHtml;
-
-      } catch (aiErr: any) {
-        console.error("AGY Bridge / Multi-agent execution error:", aiErr);
-        return new Response(
-          JSON.stringify({ error: `Multi-agent evaluation failed: ${aiErr.message || aiErr}` }),
-          {
-            status: 500,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      if (!critique) {
-        return new Response(
-          JSON.stringify({ error: "Empty critique returned from evaluation loop." }),
-          {
-            status: 500,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      // Return the completed critique
+      // Non-streaming fallback
+      const result = await executeOptimization(env, fileEntry, isPdf, jobDescription);
       return new Response(
-        JSON.stringify({
-          critique,
-          extractedTextLength: resumeMarkdown.length,
-          targetPageCount
-        }),
+        JSON.stringify(result),
         {
           status: 200,
           headers: {

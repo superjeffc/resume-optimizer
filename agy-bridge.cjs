@@ -3,217 +3,290 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8000;
 const HOST = '127.0.0.1';
 const SECRET_TOKEN = process.env.API_SECRET || '';
 const AGY_PATH = process.env.AGY_PATH || '/var/lib/agy-bridge/bin/agy';
+const MAX_CONCURRENT_JOBS = parseInt(process.env.MAX_CONCURRENT_JOBS || '1', 10); // Limit concurrency to 1 to prevent swap thrashing on 1GB RAM VM
+const MAX_QUEUE_SIZE = parseInt(process.env.MAX_QUEUE_SIZE || '10', 10);         // Max pending jobs before returning 429
+const JOB_TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || '300000', 10);     // 5 minute timeout to prevent unkillable hanging processes
+const MAX_BODY_SIZE = 5 * 1024 * 1024;                                           // 5 MB max payload size to prevent memory exhaustion
 
-const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '1', 10);
-const MAX_QUEUE_SIZE = parseInt(process.env.MAX_QUEUE_SIZE || '50', 10);
-const JOB_TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || '300000', 10);
+const ALLOWED_EFFORTS = new Set(['low', 'medium', 'high']);
+const MODEL_REGEX = /^[a-zA-Z0-9_.:-]+$/;
 
+let activeJobs = 0;
 const queue = [];
-let activeCount = 0;
-let jobCounter = 0;
 
 function processQueue() {
-  while (activeCount < MAX_CONCURRENT && queue.length > 0) {
+  while (activeJobs < MAX_CONCURRENT_JOBS && queue.length > 0) {
     const job = queue.shift();
-    if (!job || job.cancelled || job.req.destroyed || job.res.writableEnded) {
+    if (job.isAborted) {
       continue;
     }
-    executeJob(job);
+
+    activeJobs++;
+    runJob(job).finally(() => {
+      activeJobs--;
+      processQueue();
+    });
   }
 }
 
-function executeJob(job) {
-  job.started = true;
-  activeCount++;
-  const startTime = Date.now();
-  const waitTime = startTime - job.enqueuedAt;
-  console.log(`[Queue] Starting Job #${job.id} (waited ${waitTime}ms). Active: ${activeCount}/${MAX_CONCURRENT}, Queue remaining: ${queue.length}`);
+function runJob(job) {
+  return new Promise((resolve) => {
+    const { req, res, systemPrompt, userPrompt, model, effort } = job;
 
-  let tempDir = null;
-  let secureHome = null;
-  let finished = false;
-  job.finished = false;
-
-  const finishJob = () => {
-    if (finished) return;
-    finished = true;
-    job.finished = true;
-
-    if (job.timeoutTimer) {
-      clearTimeout(job.timeoutTimer);
-      job.timeoutTimer = null;
+    if (job.isAborted) {
+      resolve();
+      return;
     }
 
-    if (tempDir) {
-      try {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-        console.log(`[Job #${job.id}] Cleaned up sandbox directory: ${tempDir}`);
-      } catch (rmErr) {
-        console.error(`[Job #${job.id}] Failed to clean up sandbox directory ${tempDir}:`, rmErr);
-      }
+    // Construct combined prompt
+    let combinedPrompt = '';
+    if (systemPrompt) {
+      combinedPrompt += `System Instructions:\n${systemPrompt}\n\n`;
     }
-    if (secureHome) {
-      try {
-        fs.rmSync(secureHome, { recursive: true, force: true });
-        console.log(`[Job #${job.id}] Cleaned up secure home directory: ${secureHome}`);
-      } catch (rmErr) {
-        console.error(`[Job #${job.id}] Failed to clean up secure home directory ${secureHome}:`, rmErr);
-      }
-    }
+    combinedPrompt += `User Input:\n${userPrompt}`;
 
-    if (!job.res.writableEnded) {
-      try {
-        job.res.end();
-      } catch (e) {}
-    }
-
-    activeCount--;
-    const duration = Date.now() - startTime;
-    console.log(`[Queue] Job #${job.id} completed in ${duration}ms. Active: ${activeCount}/${MAX_CONCURRENT}, Queue remaining: ${queue.length}`);
-    process.nextTick(processQueue);
-  };
-
-  try {
-    job.res.writeHead(200, {
-      'Content-Type': 'text/plain; charset=utf-8',
-      'Transfer-Encoding': 'chunked'
-    });
-  } catch (hdrErr) {
-    console.error(`[Job #${job.id}] Error writing response headers:`, hdrErr);
-    finishJob();
-    return;
-  }
-
-  // Create temporary directory for sandbox
-  try {
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-sandbox-'));
-  } catch (dirErr) {
-    console.error(`[Job #${job.id}] Failed to create temporary directory for sandbox:`, dirErr);
-  }
-
-  // Create temporary secure HOME profile
-  try {
-    secureHome = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-home-'));
-    const secureConfigDir = path.join(secureHome, '.gemini', 'antigravity-cli');
-    fs.mkdirSync(secureConfigDir, { recursive: true });
-
-    const realConfigDir = '/var/lib/agy-bridge/.gemini/antigravity-cli';
-    
+    // Create temporary directory for sandbox
+    let tempDir = null;
     try {
-      fs.symlinkSync(
-        path.join(realConfigDir, 'antigravity-oauth-token'),
-        path.join(secureConfigDir, 'antigravity-oauth-token')
-      );
-    } catch (err) {
-      fs.copyFileSync(
-        path.join(realConfigDir, 'antigravity-oauth-token'),
-        path.join(secureConfigDir, 'antigravity-oauth-token')
-      );
+      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-sandbox-'));
+    } catch (dirErr) {
+      console.error('Failed to create temporary directory for sandbox:', dirErr);
     }
 
+    // Create temporary secure HOME profile to prevent non-workspace file access
+    let secureHome = null;
+    let homePath = null;
     try {
-      fs.symlinkSync(
-        path.join(realConfigDir, 'installation_id'),
-        path.join(secureConfigDir, 'installation_id')
-      );
-    } catch (err) {
-      fs.copyFileSync(
-        path.join(realConfigDir, 'installation_id'),
-        path.join(secureConfigDir, 'installation_id')
-      );
-    }
+      homePath = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-home-'));
+      const secureConfigDir = path.join(homePath, '.gemini', 'antigravity-cli');
+      fs.mkdirSync(secureConfigDir, { recursive: true });
 
-    fs.writeFileSync(
-      path.join(secureConfigDir, 'settings.json'),
-      JSON.stringify({ allowNonWorkspaceAccess: false })
-    );
-  } catch (homeErr) {
-    console.error(`[Job #${job.id}] Failed to initialize secure HOME profile:`, homeErr);
-  }
-
-  if (!tempDir || !secureHome) {
-    console.error(`[Job #${job.id}] Failed to initialize secure execution environment (tempDir or secureHome missing).`);
-    if (!job.res.writableEnded) {
-      job.res.write('[Error: Failed to initialize secure execution environment]');
-    }
-    finishJob();
-    return;
-  }
-
-  // Construct combined prompt
-  let combinedPrompt = '';
-  if (job.systemPrompt) {
-    combinedPrompt += `System Instructions:\n${job.systemPrompt}\n\n`;
-  }
-  combinedPrompt += `User Input:\n${job.userPrompt}`;
-
-  // Execution timeout handler
-  job.timeoutTimer = setTimeout(() => {
-    console.error(`[Job #${job.id}] Timed out after ${JOB_TIMEOUT_MS}ms`);
-    if (job.agyProcess && !finished) {
+      const realConfigDir = '/var/lib/agy-bridge/.gemini/antigravity-cli';
+      
+      // Copy or symlink credentials and installation ID
       try {
-        job.agyProcess.kill('SIGKILL');
-      } catch (e) {}
-    }
-    if (!job.res.writableEnded) {
-      job.res.write('\n[Error: Job execution timed out]');
-    }
-    finishJob();
-  }, JOB_TIMEOUT_MS);
+        fs.symlinkSync(
+          path.join(realConfigDir, 'antigravity-oauth-token'),
+          path.join(secureConfigDir, 'antigravity-oauth-token')
+        );
+      } catch (err) {
+        fs.copyFileSync(
+          path.join(realConfigDir, 'antigravity-oauth-token'),
+          path.join(secureConfigDir, 'antigravity-oauth-token')
+        );
+      }
 
-  try {
-    console.log(`[Job #${job.id}] Executing AGY command...`);
-    const agyArgs = ['--sandbox', '--print', combinedPrompt];
-    const spawnOptions = {
-      cwd: tempDir,
-      env: {
-        ...process.env,
-        HOME: secureHome
+      try {
+        fs.symlinkSync(
+          path.join(realConfigDir, 'installation_id'),
+          path.join(secureConfigDir, 'installation_id')
+        );
+      } catch (err) {
+        fs.copyFileSync(
+          path.join(realConfigDir, 'installation_id'),
+          path.join(secureConfigDir, 'installation_id')
+        );
+      }
+
+      // Write settings.json forcing allowNonWorkspaceAccess to false
+      fs.writeFileSync(
+        path.join(secureConfigDir, 'settings.json'),
+        JSON.stringify({ allowNonWorkspaceAccess: false })
+      );
+
+      // Only assign after full initialization succeeds atomically
+      secureHome = homePath;
+    } catch (homeErr) {
+      console.error('Failed to initialize secure HOME profile:', homeErr);
+      if (homePath) {
+        try {
+          fs.rmSync(homePath, { recursive: true, force: true });
+        } catch (e) {}
+      }
+      secureHome = null;
+    }
+
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      if (tempDir) {
+        try {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+          console.log(`Cleaned up sandbox directory: ${tempDir}`);
+          tempDir = null;
+        } catch (rmErr) {
+          console.error(`Failed to clean up sandbox directory ${tempDir}:`, rmErr);
+        }
+      }
+      if (secureHome) {
+        try {
+          fs.rmSync(secureHome, { recursive: true, force: true });
+          console.log(`Cleaned up secure home directory: ${secureHome}`);
+          secureHome = null;
+        } catch (rmErr) {
+          console.error(`Failed to clean up secure home directory ${secureHome}:`, rmErr);
+        }
       }
     };
-    const agy = spawn(AGY_PATH, agyArgs, spawnOptions);
-    job.agyProcess = agy;
 
-    agy.stdout.on('data', (chunk) => {
-      if (!finished && !job.res.writableEnded) {
-        job.res.write(chunk);
+    let isResolved = false;
+    let timeoutTimer = null;
+
+    const done = () => {
+      if (isResolved) return;
+      isResolved = true;
+      job.isCompleted = true;
+
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
       }
-    });
 
-    agy.stderr.on('data', (chunk) => {
-      console.error(`[Job #${job.id}] agy stderr: ${chunk}`);
-    });
+      cleanup();
 
-    agy.on('close', (code) => {
-      console.log(`[Job #${job.id}] agy process completed with code ${code}`);
-      finishJob();
-    });
-
-    agy.on('error', (err) => {
-      console.error(`[Job #${job.id}] Failed to start agy process:`, err);
-      if (!finished && !job.res.writableEnded) {
-        job.res.write(`\n[Error: Failed to execute agy CLI: ${err.message}]`);
+      if (!res.writableEnded) {
+        try {
+          res.end();
+        } catch (e) {}
       }
-      finishJob();
-    });
-  } catch (spawnErr) {
-    console.error(`[Job #${job.id}] Synchronous error spawning agy process:`, spawnErr);
-    if (!finished && !job.res.writableEnded) {
-      job.res.write(`\n[Error: Failed to spawn agy CLI: ${spawnErr.message}]`);
+
+      resolve();
+    };
+
+    // Fail closed: reject request if the secure sandboxed environment could not be fully initialized
+    if (!tempDir || !secureHome) {
+      console.error('Failed to initialize secure execution environment (tempDir or secureHome is missing).');
+      if (!res.headersSent && !res.writableEnded) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Failed to initialize secure execution environment' }));
+      }
+      done();
+      return;
     }
-    finishJob();
-  }
+
+    let agy = null;
+
+    // Abort handler: ensures process is terminated and fully closed before freeing resources
+    job.onAbort = () => {
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
+
+      const isAgyRunning = agy && !agy.killed && agy.exitCode === null && agy.signalCode === null;
+      if (isAgyRunning) {
+        console.log('Client aborted connection. Terminating agy process...');
+        const killTimer = setTimeout(() => {
+          if (agy && !agy.killed) {
+            agy.kill('SIGKILL');
+          }
+        }, 3000);
+
+        agy.once('close', () => {
+          clearTimeout(killTimer);
+          done();
+        });
+
+        try {
+          agy.kill('SIGTERM');
+        } catch (e) {}
+      } else {
+        done();
+      }
+    };
+
+    if (job.isAborted) {
+      job.onAbort();
+      return;
+    }
+
+    try {
+      // Flush response headers immediately to inform Cloudflare / proxy of active connection
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Transfer-Encoding': 'chunked',
+        'Cache-Control': 'no-cache',
+        'X-Content-Type-Options': 'nosniff'
+      });
+      if (res.flushHeaders) {
+        res.flushHeaders();
+      }
+
+      // Spawn agy process with sandbox and security flags
+      console.log(`[Queue: ${queue.length} pending, active: ${activeJobs}] Executing AGY command for request...`);
+      const agyArgs = ['--sandbox', '--disable-slash-commands', '--print', combinedPrompt];
+      if (model && typeof model === 'string' && MODEL_REGEX.test(model) && !model.startsWith('-')) {
+        agyArgs.push('--model', model);
+      }
+      if (effort && typeof effort === 'string' && ALLOWED_EFFORTS.has(effort)) {
+        agyArgs.push('--effort', effort);
+      }
+
+      const spawnOptions = {
+        cwd: tempDir,
+        env: {
+          ...process.env,
+          HOME: secureHome
+        }
+      };
+
+      agy = spawn(AGY_PATH, agyArgs, spawnOptions);
+
+      // Timeout watchdog to prevent deadlocks / infinite stalls
+      timeoutTimer = setTimeout(() => {
+        console.error(`Job execution timed out after ${JOB_TIMEOUT_MS}ms. Killing process...`);
+        if (!res.writableEnded) {
+          res.write('\n[Error: Job execution timed out]');
+        }
+        if (agy && !agy.killed) {
+          agy.kill('SIGKILL');
+        }
+        setTimeout(done, 1000);
+      }, JOB_TIMEOUT_MS);
+
+      agy.stdout.on('data', (chunk) => {
+        if (!res.writableEnded) {
+          res.write(chunk);
+        }
+      });
+
+      agy.stderr.on('data', (chunk) => {
+        console.error(`agy stderr: ${chunk}`);
+      });
+
+      agy.on('close', (code) => {
+        console.log(`agy process completed with code ${code}`);
+        done();
+      });
+
+      agy.on('error', (err) => {
+        console.error('Failed to start agy process:', err);
+        if (!res.writableEnded) {
+          res.write(`\n[Error: Failed to execute agy CLI: ${err.message}]`);
+        }
+        done();
+      });
+    } catch (spawnErr) {
+      console.error('Synchronous error spawning agy process:', spawnErr);
+      if (!res.writableEnded) {
+        res.write(`\n[Error: Failed to spawn agy CLI: ${spawnErr.message}]`);
+      }
+      done();
+    }
+  });
 }
 
 const server = http.createServer((req, res) => {
   // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') {
@@ -222,36 +295,49 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Health and queue status monitoring endpoint
-  if (req.method === 'GET' && (req.url === '/status' || req.url === '/health' || req.url === '/queue')) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'ok',
-      activeCount,
-      queueLength: queue.length,
-      maxConcurrent: MAX_CONCURRENT,
-      maxQueueSize: MAX_QUEUE_SIZE
-    }));
-    return;
-  }
-
   if (req.method === 'POST' && req.url === '/execute') {
-    const authHeader = req.headers['authorization'];
-    if (!authHeader || authHeader !== `Bearer ${SECRET_TOKEN}`) {
+    if (!SECRET_TOKEN) {
+      console.warn('WARNING: API_SECRET is not configured on server.');
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Server misconfiguration: API_SECRET not set' }));
+      return;
+    }
+
+    const authHeader = req.headers['authorization'] || '';
+    const expectedAuth = `Bearer ${SECRET_TOKEN}`;
+
+    const authBuf = Buffer.from(authHeader);
+    const expectedBuf = Buffer.from(expectedAuth);
+    if (authBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(authBuf, expectedBuf)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
     }
 
     let body = '';
+    let bodySize = 0;
+    let exceeded = false;
+
     req.on('data', chunk => {
+      bodySize += chunk.length;
+      if (bodySize > MAX_BODY_SIZE) {
+        exceeded = true;
+        if (!res.writableEnded) {
+          res.writeHead(413, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Payload Too Large (Max 5MB)' }));
+        }
+        req.destroy();
+        return;
+      }
       body += chunk;
     });
 
     req.on('end', () => {
+      if (exceeded) return;
+
       try {
         const data = JSON.parse(body);
-        const { systemPrompt, userPrompt } = data;
+        const { systemPrompt, userPrompt, model, effort } = data;
         
         if (!userPrompt) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -260,52 +346,38 @@ const server = http.createServer((req, res) => {
         }
 
         if (queue.length >= MAX_QUEUE_SIZE) {
-          console.warn(`[Queue] Rejecting request: queue full (${queue.length}/${MAX_QUEUE_SIZE})`);
-          res.writeHead(503, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            error: 'Bridge service is at capacity. Please try again shortly.',
-            activeCount,
-            queueLength: queue.length
-          }));
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Too Many Requests: Server queue is full' }));
           return;
         }
 
-        jobCounter++;
         const job = {
-          id: jobCounter,
-          systemPrompt,
-          userPrompt,
           req,
           res,
-          enqueuedAt: Date.now(),
-          cancelled: false,
-          started: false,
-          finished: false,
-          timeoutTimer: null,
-          agyProcess: null
+          systemPrompt,
+          userPrompt,
+          model,
+          effort,
+          isCompleted: false,
+          isAborted: false,
+          onAbort: null
         };
 
-        const onClientClose = () => {
-          if (!job.started) {
-            job.cancelled = true;
+        res.on('close', () => {
+          if (!job.isCompleted) {
+            job.isAborted = true;
             const idx = queue.indexOf(job);
             if (idx !== -1) {
               queue.splice(idx, 1);
-              console.log(`[Queue] Job #${job.id} cancelled while waiting in queue. Queue length: ${queue.length}`);
+              console.log(`[Queue] Job removed from queue on client disconnect. Queue remaining: ${queue.length}`);
             }
-          } else if (job.agyProcess && !job.finished) {
-            console.log(`[Queue] Killing running Job #${job.id} due to client disconnect.`);
-            try {
-              job.agyProcess.kill('SIGTERM');
-            } catch (e) {}
+            if (job.onAbort) {
+              job.onAbort();
+            }
           }
-        };
-
-        req.on('close', onClientClose);
+        });
 
         queue.push(job);
-        console.log(`[Queue] Job #${job.id} enqueued. Position: ${queue.length}, Active: ${activeCount}/${MAX_CONCURRENT}`);
-
         processQueue();
 
       } catch (err) {
@@ -313,13 +385,29 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: 'Invalid JSON payload' }));
       }
     });
+  } else if (req.method === 'GET' && req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      activeJobs,
+      queueLength: queue.length
+    }));
   } else {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not Found' }));
   }
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Bridge server listening on http://${HOST}:${PORT} (MAX_CONCURRENT=${MAX_CONCURRENT}, MAX_QUEUE_SIZE=${MAX_QUEUE_SIZE})`);
-});
+const gracefulShutdown = () => {
+  console.log('Received termination signal. Closing bridge server...');
+  server.close(() => {
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 5000).unref();
+};
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
 
+server.listen(PORT, HOST, () => {
+  console.log(`Bridge server listening on http://${HOST}:${PORT} (Concurrency limit: ${MAX_CONCURRENT_JOBS})`);
+});

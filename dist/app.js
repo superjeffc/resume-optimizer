@@ -42,38 +42,96 @@ const charLimitWarning = document.getElementById('char-limit-warning');
 let selectedFile = null;
 let currentCritiqueMarkdown = "";
 let currentResumeHtml = "";
-let loadingInterval = null;
 let targetPageCount = 1;
 
-const loadingMessages = [
-  "Reading résumé file...",
-  "Extracting text content...",
-  "Analyzing technical skills matrix...",
-  "Evaluating experience and bullet metrics...",
-  "Evaluating professional experience spacing...",
-  "Synthesizing formatting suggestions...",
-  "Checking bullet point action verb alignment...",
-  "Aggregating feedback...",
-  "Optimizing page content density...",
-  "Parsing technical keyword groups...",
-  "Organizing credentials and headers...",
-  "Structuring education and details...",
-  "Reviewing margins and print layout...",
-  "Identifying areas for layout improvement...",
-  "Generating hiring manager critique...",
-  "Polishing rewritten résumé suggestions...",
-  "Running visual layout checks...",
-  "Assembling final critique report..."
+// Real-time subagent progress tracking DOM elements
+const loadingSubagentsCount = document.getElementById('loading-subagents-count');
+const loadingSubagentsTotal = document.getElementById('loading-subagents-total');
+const loadingPercent = document.getElementById('loading-percent');
+const loadingProgressBar = document.getElementById('loading-progress-bar');
+const loadingAgentList = document.getElementById('loading-agent-list');
+
+const PIPELINE_STAGES = [
+  { id: 'extraction', label: 'Document Ingestion & Text Extraction' },
+  { id: 'ats', label: 'ATS & Keyword Matcher Agent', requiresJobDesc: true },
+  { id: 'grammar', label: 'Grammar, Tone & Impact Coach' },
+  { id: 'layout', label: 'Layout & Spacing Auditor' },
+  { id: 'editor', label: 'Editor-in-Chief Synthesis Agent' },
+  { id: 'validator', label: 'Compliance Auditor & Validator' }
 ];
 
-function getShuffledLoadingMessages() {
-  const firstMessage = loadingMessages[0];
-  const remainingMessages = loadingMessages.slice(1);
-  for (let i = remainingMessages.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [remainingMessages[i], remainingMessages[j]] = [remainingMessages[j], remainingMessages[i]];
+function initLoadingUI(hasJobDesc) {
+  const activeStages = PIPELINE_STAGES.filter(s => !s.requiresJobDesc || hasJobDesc);
+  const totalSubagents = hasJobDesc ? 5 : 4;
+
+  if (loadingSubagentsCount) loadingSubagentsCount.textContent = "0";
+  if (loadingSubagentsTotal) loadingSubagentsTotal.textContent = String(totalSubagents);
+  if (loadingPercent) loadingPercent.textContent = "5%";
+  if (loadingProgressBar) loadingProgressBar.style.width = "5%";
+  if (loadingStep) loadingStep.textContent = "Extracting text and document structure...";
+
+  if (loadingAgentList) {
+    loadingAgentList.innerHTML = activeStages.map(stage => `
+      <div id="step-${stage.id}" class="flex items-center justify-between py-1.5 px-2.5 rounded-lg text-gray-500 transition-all duration-200">
+        <div class="flex items-center gap-2.5">
+          <span class="step-indicator w-4 h-4 rounded-full flex items-center justify-center text-[10px] bg-slate-800 border border-slate-700 text-gray-500 font-mono">○</span>
+          <span class="step-label font-medium">${stage.label}</span>
+        </div>
+        <span class="step-status text-[11px] text-gray-600 font-mono">Waiting</span>
+      </div>
+    `).join('');
   }
-  return [firstMessage, ...remainingMessages];
+}
+
+function updateProgressUI(event) {
+  if (loadingStep && event.message) {
+    loadingStep.textContent = event.message;
+  }
+  if (loadingSubagentsCount && event.completedAgents !== undefined) {
+    loadingSubagentsCount.textContent = String(event.completedAgents);
+  }
+  if (loadingSubagentsTotal && event.totalAgents !== undefined) {
+    loadingSubagentsTotal.textContent = String(event.totalAgents);
+  }
+  if (loadingPercent && event.percent !== undefined) {
+    loadingPercent.textContent = `${event.percent}%`;
+  }
+  if (loadingProgressBar && event.percent !== undefined) {
+    loadingProgressBar.style.width = `${Math.max(5, Math.min(100, event.percent))}%`;
+  }
+
+  if (event.stage && loadingAgentList) {
+    const isDone = event.stage.endsWith('_done');
+    const stageKey = event.stage.replace('_done', '');
+    const currentStepEl = document.getElementById(`step-${stageKey}`);
+
+    if (currentStepEl) {
+      const indicator = currentStepEl.querySelector('.step-indicator');
+      const statusText = currentStepEl.querySelector('.step-status');
+      
+      if (isDone) {
+        currentStepEl.className = 'flex items-center justify-between py-1.5 px-2.5 rounded-lg text-emerald-400 bg-emerald-950/30 border border-emerald-900/50';
+        if (indicator) {
+          indicator.className = 'step-indicator w-4 h-4 rounded-full flex items-center justify-center text-[10px] bg-emerald-900 border border-emerald-500 text-emerald-300 font-bold';
+          indicator.textContent = '✓';
+        }
+        if (statusText) {
+          statusText.className = 'step-status text-[11px] text-emerald-400 font-mono font-semibold';
+          statusText.textContent = 'Done';
+        }
+      } else {
+        currentStepEl.className = 'flex items-center justify-between py-1.5 px-2.5 rounded-lg text-indigo-300 bg-indigo-950/40 border border-indigo-900/60 shadow-sm';
+        if (indicator) {
+          indicator.className = 'step-indicator w-4 h-4 rounded-full flex items-center justify-center text-[10px] bg-indigo-900 border border-indigo-500 text-cyan-300 animate-pulse font-bold';
+          indicator.textContent = '●';
+        }
+        if (statusText) {
+          statusText.className = 'step-status text-[11px] text-cyan-300 font-mono animate-pulse';
+          statusText.textContent = 'Running...';
+        }
+      }
+    }
+  }
 }
 
 // Prevent default drag behaviors for the entire window to stop the browser from opening files
@@ -272,15 +330,7 @@ analyzeBtn.addEventListener('click', async () => {
   uploadCard.classList.add('hidden');
   loadingCard.classList.remove('hidden');
   
-  const shuffledMessages = getShuffledLoadingMessages();
-  let stepIndex = 0;
-  loadingStep.textContent = shuffledMessages[0];
-  
-  // Cycle loading messages dynamically
-  loadingInterval = setInterval(() => {
-    stepIndex = (stepIndex + 1) % shuffledMessages.length;
-    loadingStep.textContent = shuffledMessages[stepIndex];
-  }, 3500);
+  initLoadingUI(Boolean(jobDesc));
 
   const formData = new FormData();
   formData.append('resume', selectedFile);
@@ -290,7 +340,10 @@ analyzeBtn.addEventListener('click', async () => {
   }
 
   try {
-    const response = await fetch(API_URL, {
+    const streamUrl = new URL(API_URL, window.location.origin);
+    streamUrl.searchParams.set('stream', 'true');
+
+    const response = await fetch(streamUrl.toString(), {
       method: 'POST',
       body: formData
     });
@@ -311,11 +364,51 @@ analyzeBtn.addEventListener('click', async () => {
       throw new Error(errorMsg);
     }
 
-    let data;
-    try {
-      data = await response.json();
-    } catch (parseErr) {
-      throw new Error(`Failed to parse API response as JSON: ${parseErr.message}`);
+    let data = null;
+    const contentType = response.headers.get('content-type') || '';
+
+    if (contentType.includes('application/x-ndjson') || contentType.includes('text/event-stream')) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep last partial line in buffer
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          let parsed;
+          try {
+            parsed = JSON.parse(trimmed);
+          } catch (e) {
+            continue;
+          }
+
+          if (parsed.type === 'progress') {
+            updateProgressUI(parsed);
+          } else if (parsed.type === 'complete') {
+            data = parsed;
+          } else if (parsed.type === 'error') {
+            throw new Error(parsed.error || 'Agent evaluation failed.');
+          }
+        }
+      }
+
+      if (!data) {
+        throw new Error('Analysis stream closed before completion.');
+      }
+    } else {
+      try {
+        data = await response.json();
+      } catch (parseErr) {
+        throw new Error(`Failed to parse API response as JSON: ${parseErr.message}`);
+      }
     }
 
     const rawCritique = data.critique || "";
@@ -346,7 +439,6 @@ analyzeBtn.addEventListener('click', async () => {
 
     currentCritiqueMarkdown = critiquePart;
     currentResumeHtml = resumeHtmlPart;
-    
 
     targetPageCount = data.targetPageCount || 1;
     
@@ -367,8 +459,6 @@ analyzeBtn.addEventListener('click', async () => {
       extractedMeta.textContent = `Processed ${formatBytes(data.extractedTextLength || 0)} of raw résumé text`;
     }
 
-
-
     // Transition to Results Card
     loadingCard.classList.add('hidden');
     resultsCard.classList.remove('hidden');
@@ -380,11 +470,6 @@ analyzeBtn.addEventListener('click', async () => {
     // Revert back to upload page
     loadingCard.classList.add('hidden');
     uploadCard.classList.remove('hidden');
-  } finally {
-    if (loadingInterval) {
-      clearInterval(loadingInterval);
-      loadingInterval = null;
-    }
   }
 });
 
