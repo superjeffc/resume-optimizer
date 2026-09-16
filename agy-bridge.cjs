@@ -207,6 +207,8 @@ async function runAsyncPipeline(job, data) {
 
       completedAgents++;
       job.completedAgents = completedAgents;
+      if (!job.completedStages) job.completedStages = ['extraction'];
+      if (!job.completedStages.includes('ats')) job.completedStages.push('ats');
       job.stage = 'ats_done';
       job.percent = 35;
       job.message = `ATS & Keyword Matcher finished (${completedAgents}/${totalAgents} subagents complete).`;
@@ -227,6 +229,8 @@ async function runAsyncPipeline(job, data) {
 
     completedAgents++;
     job.completedAgents = completedAgents;
+    if (!job.completedStages) job.completedStages = ['extraction'];
+    if (!job.completedStages.includes('grammar')) job.completedStages.push('grammar');
     job.stage = 'grammar_done';
     job.percent = 55;
     job.message = `Grammar, Tone & Impact Coach finished (${completedAgents}/${totalAgents} subagents complete).`;
@@ -246,6 +250,8 @@ async function runAsyncPipeline(job, data) {
 
     completedAgents++;
     job.completedAgents = completedAgents;
+    if (!job.completedStages) job.completedStages = ['extraction'];
+    if (!job.completedStages.includes('layout')) job.completedStages.push('layout');
     job.stage = 'layout_done';
     job.percent = 70;
     job.message = `Layout & Spacing Auditor finished (${completedAgents}/${totalAgents} subagents complete).`;
@@ -286,6 +292,8 @@ async function runAsyncPipeline(job, data) {
       if (attempts === 1) {
         completedAgents++;
         job.completedAgents = completedAgents;
+        if (!job.completedStages) job.completedStages = ['extraction'];
+        if (!job.completedStages.includes('editor')) job.completedStages.push('editor');
         job.stage = 'editor_done';
         job.percent = 85;
         job.message = `Editor-in-Chief finished initial draft (${completedAgents}/${totalAgents} subagents complete).`;
@@ -312,6 +320,8 @@ async function runAsyncPipeline(job, data) {
         console.log(`[Job ${job.id}] Compliance audit passed.`);
         completedAgents++;
         job.completedAgents = completedAgents;
+        if (!job.completedStages) job.completedStages = ['extraction'];
+        if (!job.completedStages.includes('validator')) job.completedStages.push('validator');
         job.stage = 'validator_done';
         job.percent = 100;
         job.message = `Compliance audit passed! (${completedAgents}/${totalAgents} subagents complete).`;
@@ -620,6 +630,7 @@ const server = http.createServer((req, res) => {
           id: jobId,
           status: 'queued',
           stage: 'queued',
+          completedStages: ['extraction'],
           completedAgents: 0,
           totalAgents: data.jobDescription ? 5 : 4,
           percent: 5,
@@ -702,6 +713,7 @@ const server = http.createServer((req, res) => {
       id: job.id,
       status: job.status,
       stage: job.stage,
+      completedStages: job.completedStages || [],
       completedAgents: job.completedAgents,
       totalAgents: job.totalAgents,
       percent: job.percent,

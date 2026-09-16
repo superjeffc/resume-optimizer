@@ -147,31 +147,53 @@ function updateProgressUI(event) {
     if (loadingSubagentsTotal && loadingSubagentsCount) {
       loadingSubagentsCount.textContent = loadingSubagentsTotal.textContent;
     }
+    if (loadingPercent) {
+      loadingPercent.textContent = '100%';
+    }
+    if (loadingProgressBar) {
+      loadingProgressBar.style.width = '100%';
+    }
     return;
   }
 
-  if (event.stage) {
-    const isDone = event.stage.endsWith('_done');
-    const stageKey = event.stage.replace('_done', '');
+  if (event.stage || event.completedAgents !== undefined || event.completedStages) {
+    const isDone = typeof event.stage === 'string' && event.stage.endsWith('_done');
+    const stageKey = typeof event.stage === 'string' ? event.stage.replace('_done', '') : '';
 
     // Determine active stages currently in the DOM
     const domStages = PIPELINE_STAGES.filter(s => document.getElementById(`step-${s.id}`));
+    const subagentStages = domStages.filter(s => s.id !== 'extraction');
     const currentIndex = domStages.findIndex(s => s.id === stageKey);
 
-    if (currentIndex !== -1) {
-      domStages.forEach((stage, idx) => {
-        if (idx < currentIndex) {
-          // Preceding stages are completed
-          setStageState(stage.id, 'done');
-        } else if (idx === currentIndex) {
-          // Current stage is running or done
-          setStageState(stage.id, isDone ? 'done' : 'running');
-        } else {
-          // Following stages are still waiting
-          setStageState(stage.id, 'waiting');
-        }
-      });
+    // Extraction stage is marked done as soon as any background agent runs or extraction completes
+    if (stageKey !== 'extraction') {
+      setStageState('extraction', 'done');
+    } else {
+      setStageState('extraction', isDone ? 'done' : 'running');
     }
+
+    subagentStages.forEach((stage, subIdx) => {
+      // 1. Check if explicitly reported in completedStages array
+      if (event.completedStages && Array.isArray(event.completedStages) && event.completedStages.includes(stage.id)) {
+        setStageState(stage.id, 'done');
+      }
+      // 2. Check if completedAgents count covers this subagent
+      else if (event.completedAgents !== undefined && subIdx < event.completedAgents) {
+        setStageState(stage.id, 'done');
+      }
+      // 3. Check if this is the currently active/reported stage
+      else if (stage.id === stageKey) {
+        setStageState(stage.id, isDone ? 'done' : 'running');
+      }
+      // 4. Check if preceding stage by index in active domStages
+      else if (currentIndex !== -1 && domStages.findIndex(s => s.id === stage.id) < currentIndex) {
+        setStageState(stage.id, 'done');
+      }
+      // 5. Otherwise still waiting
+      else {
+        setStageState(stage.id, 'waiting');
+      }
+    });
   }
 }
 
@@ -440,6 +462,12 @@ analyzeBtn.addEventListener('click', async () => {
           if (parsed.type === 'progress') {
             updateProgressUI(parsed);
           } else if (parsed.type === 'complete') {
+            updateProgressUI({
+              status: 'complete',
+              percent: 100,
+              message: 'Optimization complete! Finalizing optimized résumé...'
+            });
+            await new Promise(resolve => setTimeout(resolve, 800));
             data = parsed;
           } else if (parsed.type === 'error') {
             throw new Error(parsed.error || 'Agent evaluation failed.');
@@ -504,6 +532,15 @@ analyzeBtn.addEventListener('click', async () => {
 
           if (jobStatus.status === 'complete') {
             data = jobStatus.result || jobStatus;
+            updateProgressUI({
+              status: 'complete',
+              percent: 100,
+              completedAgents: jobStatus.totalAgents || (jobDesc ? 5 : 4),
+              totalAgents: jobStatus.totalAgents || (jobDesc ? 5 : 4),
+              message: 'Optimization complete! Finalizing optimized résumé...'
+            });
+            // Give user a brief moment (800ms) to see all subagents in the green Done state
+            await new Promise(resolve => setTimeout(resolve, 800));
             break;
           } else if (jobStatus.status === 'error') {
             throw new Error(jobStatus.error || 'Optimization pipeline encountered an error.');
