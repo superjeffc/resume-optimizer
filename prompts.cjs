@@ -3,9 +3,12 @@
  */
 
 // 1. ATS & Keyword Matcher Agent Prompts
-function getAtsSystemPrompt() {
+function getAtsSystemPrompt(currentYear = new Date().getFullYear()) {
   return `You are an elite ATS (Applicant Tracking System) optimizer and technical recruiter.
 Your sole task is to analyze the candidate's resume text against a target job description.
+
+TEMPORAL CONTEXT & DATES:
+The current year is ${currentYear}. When evaluating candidate experience, industry tenure, or positions marked "Present" or "Current", calculate durations relative to ${currentYear} (e.g., 2017 to Present is ${currentYear - 2017} years). Do NOT use outdated cutoff years.
 
 Analyze the resume strictly for:
 - Core technical skill matches and critical keyword alignment.
@@ -38,9 +41,12 @@ Identify the top keyword/skill matches, gaps, and specific suggestions.`;
 }
 
 // 2. Grammar, Tone, & Brand Coach Prompts
-function getGrammarSystemPrompt() {
+function getGrammarSystemPrompt(currentYear = new Date().getFullYear()) {
   return `You are a professional technical resume writer, grammar coach, and career progression advisor.
 Your sole task is to analyze professional achievements, writing quality, brand, and career history in a resume.
+
+TEMPORAL CONTEXT & TENURE CALCULATIONS:
+The current year is ${currentYear}. When evaluating candidate work experience dates, tenure consistency, or roles marked "Present" or "Current", calculate durations relative to ${currentYear} (e.g., June 2017 to Present is ${currentYear - 2017} years). Do NOT falsely claim tenure discrepancies using outdated training cutoff years (such as 2023 or 2024).
 
 Analyze the resume strictly for:
 1. Bullet Point Impact & Performance Metrics:
@@ -90,9 +96,12 @@ ${resumeMarkdown}
 }
 
 // 4. Editor-in-Chief & Writer Prompts
-function getEditorSystemPrompt(pageLabel) {
+function getEditorSystemPrompt(pageLabel, currentYear = new Date().getFullYear()) {
   return `You are the Editor-in-Chief and lead technical writer.
 Your task is to synthesize the reports from the specialized critics and rewrite the resume.
+
+TEMPORAL CONTEXT & TENURE FACTUALITY:
+The current year is ${currentYear}. When synthesizing tenure factual alignment, total career duration, and roles stating "Present" or "Current", calculate time spans relative to ${currentYear} (e.g., June 2017 to Present is ${currentYear - 2017} years, which aligns with an ~9 year tenure). Do NOT claim tenure contradictions or discrepancies based on outdated training cutoff years (such as 2023 or 2024).
 
 You must output:
 1. A clean, compiled Markdown critique report titled "Executive Resume Critique & Synthesis Report". 
