@@ -273,7 +273,14 @@ async function runAsyncPipeline(job, data) {
     while (attempts < maxAttempts) {
       attempts++;
       job.stage = 'editor';
-      job.percent = Math.min(85, 75 + (attempts - 1) * 5);
+      // In revision passes (attempts > 1), editor is revising and validator is reset to waiting
+      if (attempts > 1) {
+        if (job.completedStages) {
+          job.completedStages = job.completedStages.filter(s => s !== 'editor' && s !== 'validator');
+        }
+        job.completedAgents = job.completedStages ? job.completedStages.filter(s => s !== 'extraction').length : Math.max(0, completedAgents - 1);
+      }
+      job.percent = Math.max(job.percent || 0, Math.min(92, 75 + (attempts - 1) * 6));
       job.message = attempts === 1
         ? 'Editor-in-Chief: Synthesizing critiques and drafting rewritten résumé...'
         : `Editor-in-Chief: Refining draft based on validation audit (Pass ${attempts})...`;
@@ -289,16 +296,16 @@ async function runAsyncPipeline(job, data) {
       finalCritique = parts[0]?.trim() || "";
       finalHtml = parts[1]?.trim() || "";
 
-      if (attempts === 1) {
-        completedAgents++;
-        job.completedAgents = completedAgents;
-        if (!job.completedStages) job.completedStages = ['extraction'];
-        if (!job.completedStages.includes('editor')) job.completedStages.push('editor');
-        job.stage = 'editor_done';
-        job.percent = 85;
-        job.message = `Editor-in-Chief finished initial draft (${completedAgents}/${totalAgents} subagents complete).`;
-        job.updatedAt = Date.now();
-      }
+      if (!job.completedStages) job.completedStages = ['extraction'];
+      if (!job.completedStages.includes('editor')) job.completedStages.push('editor');
+      completedAgents = job.completedStages.filter(s => s !== 'extraction').length;
+      job.completedAgents = completedAgents;
+      job.stage = 'editor_done';
+      job.percent = Math.max(job.percent || 0, Math.min(94, 84 + (attempts - 1) * 4));
+      job.message = attempts === 1
+        ? `Editor-in-Chief finished initial draft (${completedAgents}/${totalAgents} subagents complete).`
+        : `Editor-in-Chief finished revision pass ${attempts} (${completedAgents}/${totalAgents} subagents complete).`;
+      job.updatedAt = Date.now();
 
       if (!finalHtml) {
         validationFeedback = "Validation Error: Could not find '=== REWRITTEN RESUME ===' delimiter or the HTML block is empty.";
@@ -306,7 +313,7 @@ async function runAsyncPipeline(job, data) {
       }
 
       job.stage = 'validator';
-      job.percent = 90;
+      job.percent = Math.max(job.percent || 0, Math.min(98, 88 + (attempts - 1) * 4));
       job.message = `Compliance Auditor: Auditing HTML draft against ATS & layout rules (Pass ${attempts})...`;
       job.updatedAt = Date.now();
       console.log(`[Job ${job.id}] Auditing HTML compliance (Attempt ${attempts})...`);
@@ -318,10 +325,9 @@ async function runAsyncPipeline(job, data) {
 
       if (auditResult.toUpperCase() === "PASS") {
         console.log(`[Job ${job.id}] Compliance audit passed.`);
-        completedAgents++;
-        job.completedAgents = completedAgents;
-        if (!job.completedStages) job.completedStages = ['extraction'];
         if (!job.completedStages.includes('validator')) job.completedStages.push('validator');
+        completedAgents = job.completedStages.filter(s => s !== 'extraction').length;
+        job.completedAgents = completedAgents;
         job.stage = 'validator_done';
         job.percent = 100;
         job.message = `Compliance audit passed! (${completedAgents}/${totalAgents} subagents complete).`;

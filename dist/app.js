@@ -59,6 +59,7 @@ const PIPELINE_STAGES = [
 
 function initLoadingUI(hasJobDesc) {
   const activeStages = PIPELINE_STAGES.filter(s => !s.requiresJobDesc || hasJobDesc);
+  maxReportedPercent = 5;
 
   if (loadingProgressBar) loadingProgressBar.style.width = "5%";
   if (loadingStep) loadingStep.textContent = "Extracting text and document structure...";
@@ -116,17 +117,23 @@ function setStageState(stageId, state) {
   }
 }
 
+let maxReportedPercent = 5;
+
 function updateProgressUI(event) {
   if (loadingStep && event.message) {
     loadingStep.textContent = event.message;
   }
-  if (loadingProgressBar && event.percent !== undefined) {
-    loadingProgressBar.style.width = `${Math.max(5, Math.min(100, event.percent))}%`;
+  if (event.percent !== undefined) {
+    maxReportedPercent = Math.max(maxReportedPercent, Number(event.percent) || 0);
+  }
+  if (loadingProgressBar) {
+    loadingProgressBar.style.width = `${Math.max(5, Math.min(100, maxReportedPercent))}%`;
   }
 
   if (!loadingAgentList) return;
 
   if (event.status === 'complete' || event.percent === 100) {
+    maxReportedPercent = 100;
     PIPELINE_STAGES.forEach(s => setStageState(s.id, 'done'));
     if (loadingProgressBar) {
       loadingProgressBar.style.width = '100%';
@@ -151,23 +158,27 @@ function updateProgressUI(event) {
     }
 
     subagentStages.forEach((stage, subIdx) => {
-      // 1. Check if explicitly reported in completedStages array
-      if (event.completedStages && Array.isArray(event.completedStages) && event.completedStages.includes(stage.id)) {
-        setStageState(stage.id, 'done');
-      }
-      // 2. Check if completedAgents count covers this subagent
-      else if (event.completedAgents !== undefined && subIdx < event.completedAgents) {
-        setStageState(stage.id, 'done');
-      }
-      // 3. Check if this is the currently active/reported stage
-      else if (stage.id === stageKey) {
+      // 1. The currently active/reported stage takes highest priority
+      if (stage.id === stageKey) {
         setStageState(stage.id, isDone ? 'done' : 'running');
       }
-      // 4. Check if preceding stage by index in active domStages
+      // 2. When editor is re-evaluating in self-correction loop, validator is waiting for draft
+      else if (stageKey === 'editor' && stage.id === 'validator') {
+        setStageState('validator', 'waiting');
+      }
+      // 3. Preceding stage by DOM index in active domStages
       else if (currentIndex !== -1 && domStages.findIndex(s => s.id === stage.id) < currentIndex) {
         setStageState(stage.id, 'done');
       }
-      // 5. Otherwise still waiting
+      // 4. Check if explicitly reported in completedStages array
+      else if (event.completedStages && Array.isArray(event.completedStages) && event.completedStages.includes(stage.id)) {
+        setStageState(stage.id, 'done');
+      }
+      // 5. Check if completedAgents count covers this subagent
+      else if (event.completedAgents !== undefined && subIdx < event.completedAgents) {
+        setStageState(stage.id, 'done');
+      }
+      // 6. Otherwise still waiting
       else {
         setStageState(stage.id, 'waiting');
       }
