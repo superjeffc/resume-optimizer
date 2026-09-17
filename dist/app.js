@@ -45,9 +45,6 @@ let currentResumeHtml = "";
 let targetPageCount = 1;
 
 // Real-time subagent progress tracking DOM elements
-const loadingSubagentsCount = document.getElementById('loading-subagents-count');
-const loadingSubagentsTotal = document.getElementById('loading-subagents-total');
-const loadingPercent = document.getElementById('loading-percent');
 const loadingProgressBar = document.getElementById('loading-progress-bar');
 const loadingAgentList = document.getElementById('loading-agent-list');
 
@@ -62,11 +59,7 @@ const PIPELINE_STAGES = [
 
 function initLoadingUI(hasJobDesc) {
   const activeStages = PIPELINE_STAGES.filter(s => !s.requiresJobDesc || hasJobDesc);
-  const totalSubagents = hasJobDesc ? 5 : 4;
 
-  if (loadingSubagentsCount) loadingSubagentsCount.textContent = "0";
-  if (loadingSubagentsTotal) loadingSubagentsTotal.textContent = String(totalSubagents);
-  if (loadingPercent) loadingPercent.textContent = "5%";
   if (loadingProgressBar) loadingProgressBar.style.width = "5%";
   if (loadingStep) loadingStep.textContent = "Extracting text and document structure...";
 
@@ -127,15 +120,6 @@ function updateProgressUI(event) {
   if (loadingStep && event.message) {
     loadingStep.textContent = event.message;
   }
-  if (loadingSubagentsCount && event.completedAgents !== undefined) {
-    loadingSubagentsCount.textContent = String(event.completedAgents);
-  }
-  if (loadingSubagentsTotal && event.totalAgents !== undefined) {
-    loadingSubagentsTotal.textContent = String(event.totalAgents);
-  }
-  if (loadingPercent && event.percent !== undefined) {
-    loadingPercent.textContent = `${event.percent}%`;
-  }
   if (loadingProgressBar && event.percent !== undefined) {
     loadingProgressBar.style.width = `${Math.max(5, Math.min(100, event.percent))}%`;
   }
@@ -144,12 +128,6 @@ function updateProgressUI(event) {
 
   if (event.status === 'complete' || event.percent === 100) {
     PIPELINE_STAGES.forEach(s => setStageState(s.id, 'done'));
-    if (loadingSubagentsTotal && loadingSubagentsCount) {
-      loadingSubagentsCount.textContent = loadingSubagentsTotal.textContent;
-    }
-    if (loadingPercent) {
-      loadingPercent.textContent = '100%';
-    }
     if (loadingProgressBar) {
       loadingProgressBar.style.width = '100%';
     }
